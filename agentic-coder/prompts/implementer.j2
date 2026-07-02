@@ -1,0 +1,26 @@
+Implement the subtask below by emitting tool calls. Follow the plan exactly and
+obey the steering rules. Write COMPLETE file contents (never diffs or
+placeholders like "... rest unchanged ...").
+
+SUBTASK: {{ subtask_id }} — {{ subtask_title }}
+
+IMPLEMENTATION PLAN:
+{{ plan }}
+
+Work in this order:
+1. EXPLORE first if anything is unclear: when you are unsure of the current
+   project layout or what an existing file already holds, run `ls -R` (or
+   `find . -type f`) and read_file the files the plan references — BEFORE writing.
+   Do not guess at code that already exists.
+2. Create every file in the plan's "Files to Create or Edit" section: write_file
+   for new files, edit_file for surgical changes to existing ones. Include a clear
+   one-line `summary` for each write.
+3. If the plan needs third-party packages, actually INSTALL them with run (e.g.
+   run `pip install -r requirements.txt`) — writing the manifest file alone does
+   not install anything, and the tests import the real packages.
+4. Add the tests from the plan's "Tests to Write" section.
+5. When all files and tests are written, reply with the single line: DONE
+
+Do NOT run the tests yourself — the orchestrator runs them after you say DONE.
+Prefer ONE tool call per message and wait for its result before the next; if you
+must emit several files at once, wrap EACH one in its own <tool_call> block.

@@ -1,0 +1,67 @@
+You are the TASK PLANNING stage. Break the project into TASKS and SUBTASKS in
+strict dependency order, sized so a small coding model can complete each subtask
+in one focused session. The FIRST task must scaffold the project (init, install
+dependencies, get the test runner working on an empty suite).
+
+LOCKED STACK:
+{{ stack }}
+
+PROJECT BRIEF:
+{{ project_brief }}
+
+REQUIREMENTS:
+{{ requirements }}
+
+ARCHITECTURE:
+{{ architecture }}
+
+SOFTWARE DESIGN:
+{{ sdd }}
+
+Rules:
+- Order subtasks so every subtask's dependencies come before it.
+- Each subtask must implement REAL, WORKING functionality plus its tests — never
+  a subtask whose only job is to create an empty file or directory. Directories
+  are created implicitly when a file is written into them.
+- `files` lists actual FILES (with extensions) the subtask creates or edits —
+  never a bare directory like "src/" or "pkg/". Every subtask creates >=1 file.
+- Keep the breakdown COARSE: prefer a handful of substantial subtasks over many
+  trivial ones. Do not split "create file" and "add function to file" apart.
+- Use names that are VALID identifiers for the language (e.g. Python package and
+  module directories must be valid module names: use underscores, never hyphens
+  or spaces).
+- The FIRST subtask scaffolds the project: create the package/module layout with
+  a minimal but real passing test, the dependency manifest, and verify the test
+  runner runs. Its `test_strategy` must run the actual test command.
+- `test_strategy` MUST be a concrete shell command plus what passing looks like
+  (e.g. "Run `pytest tests/test_calc.py -q`; all tests pass"). NEVER a prose
+  check like "verify the file exists". Tests must target the files this subtask
+  creates and must be able to actually run after this subtask.
+- `depends_on` lists subtask ids (e.g. "T001.1") that must be done first.
+- Every status starts as "pending".
+- Use ids like T001, T001.1, T001.2, T002, ...
+
+Output ONLY a single JSON object (no prose, no code fences) with this schema:
+
+{
+  "project": "<slug>",
+  "tasks": [
+    {
+      "id": "T001",
+      "title": "...",
+      "goal": "...",
+      "status": "pending",
+      "subtasks": [
+        {
+          "id": "T001.1",
+          "title": "...",
+          "intent": "why this subtask exists / what it enables",
+          "files": ["path/one", "path/two"],
+          "depends_on": [],
+          "test_strategy": "exact command + what passing looks like",
+          "status": "pending"
+        }
+      ]
+    }
+  ]
+}

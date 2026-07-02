@@ -1,0 +1,65 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Environments
+.env
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Sandbox / Generated projects by the LLM pipeline
+sandbox/
+
+# Unit test / coverage reports
+.pytest_cache/
+agentic-coder/.pytest_cache/
+.cache/
+.coverage
+htmlcov/
+
+# Node / UI build artifacts
+node_modules/
+agentic-coder/ui/node_modules/
+agentic-coder/ui/dist/
+agentic-coder/ui/.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python development / type checking
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# Logs and databases
+*.log
+*.sqlite
+*.db
+
+# OS-specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs and editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*.swo

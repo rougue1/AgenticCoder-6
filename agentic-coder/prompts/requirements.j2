@@ -1,0 +1,28 @@
+You are the REQUIREMENTS stage. Derive complete requirements from the project
+brief. Stay technology-agnostic (no frameworks/languages yet).
+
+PROJECT BRIEF:
+{{ project_brief }}
+
+Output a single markdown document, `requirements.md`, with these sections:
+
+# Requirements
+
+## Functional Requirements
+Numbered list (FR-1, FR-2, ...). Each is a single, testable capability.
+
+## Non-Functional Requirements
+Numbered list (NFR-1, ...): performance, reliability, security, usability,
+portability — only those that genuinely apply.
+
+## Core Entities / Data Model (conceptual)
+The key domain objects and their important fields and relationships, described
+abstractly (no DB technology).
+
+## User Flows
+The primary end-to-end flows, step by step.
+
+## Assumptions & Open Questions
+Anything you had to assume; note sensible defaults you chose.
+
+Be thorough but do not pad. Output ONLY the markdown document.

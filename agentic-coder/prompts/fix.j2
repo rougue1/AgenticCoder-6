@@ -1,0 +1,23 @@
+The tests FAILED. Fix the problem using tool calls. Make the smallest correct
+change that addresses the actual error — do not rewrite unrelated code.
+
+Test command: {{ cmd }}
+Exit code: {{ exit_code }}
+Attempt: {{ attempt }} of {{ max_attempts }}
+
+--- STDOUT ---
+{{ stdout if stdout else "(empty)" }}
+
+--- STDERR ---
+{{ stderr if stderr else "(empty)" }}
+
+Diagnose the root cause, then:
+1. Use read_file if you need to re-check the current contents of a file.
+2. Use edit_file to make the smallest targeted change that fixes the actual error
+   (replace the exact broken lines). Only fall back to write_file with the COMPLETE
+   file contents if the fix is structural and touches most of the file — rewriting a
+   whole file to fix one line risks injecting a new typo.
+3. When your fix is in place, reply with the single line: DONE
+
+The orchestrator will re-run the tests after you say DONE. Emit ONE tool call per
+message and wait for its result.

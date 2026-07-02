@@ -1,0 +1,67 @@
+# Per-phase INPUT token budgets, sized for num_ctx: 32768 in config.yaml. These
+# must stay consistent with num_ctx: a phase packs its input to
+# (budget - reserve_for_output), leaving the rest of the window for the response.
+# If you change num_ctx for a different machine, move these together.
+#
+# The compressor logs every decision when it trims a phase's context below its
+# budget; it never silently truncates mid-file.
+
+reserve_for_output:
+    8192 # room left for the model's answer (and any thinking tokens). With the
+    # 32768 budgets below this leaves ~24576 tokens for input and ~8192 for output —
+    # enough for a qwen3.6 reasoning pass plus a structured doc/tool call. Raise
+    # num_ctx if a big task plan or review ever gets cut off mid-output.
+
+budgets:
+    # ── REASONING / ARCHITECTURE PHASES (qwen3.6:27b /think) ──────────────────
+    # Packed to 32768 - 8192 = 24576 input tokens; the compressor summarizes the
+    # most distant blocks (via file_manifest.md) to fit, keeping steering + the
+    # active spec verbatim.
+    architect: 32768
+    sdd_generator: 32768
+    requirements: 32768
+    stack_decider: 32768
+    task_planner: 32768
+
+    # ── PER-SUBTASK PLANNER + ESCALATION ──────────────────────────────────────
+    planner: 32768
+    escalation: 32768
+
+    # ── CODING PHASES (qwen3-coder:30b) ───────────────────────────────────────
+    # The ephemeral implement/test/fix conversation is packed newest-first to this
+    # budget (context/conversation.py) so a long subtask can't overrun the window
+    # and make Ollama drop the system prompt. (The implementer writes its own tests
+    # in this same conversation — there is no separate `tester` phase/budget.)
+    implementer: 32768
+
+    # ── TOOL CALLER / ROUTER (qwen2.5-coder:14b) ──────────────────────────────
+    # Sees a re-ask prompt plus the mis-formatted output it must convert into clean
+    # tool calls — which can carry one or more whole files, so give it real room.
+    tool_caller: 24576
+
+    # ── INTAKE ────────────────────────────────────────────────────────────────
+    # Only sees the user's raw prompt (sent direct, not packed) — sized above the
+    # output reserve so usable input stays sane.
+    intake: 16384
+
+    # ── FINAL REVIEW (qwen3-coder:30b) ────────────────────────────────────────
+    reviewer: 32768
+
+# ── COMPRESSION POLICY ────────────────────────────────────────────────────
+# When assembled context exceeds the phase budget, the compressor must:
+# 1. Always keep verbatim: steering.md, the current task/subtask spec, the plan.
+# 2. Always keep verbatim: files the current subtask directly creates/edits.
+# 3. Summarize to one-liners (using file_manifest.md descriptions): completed
+#    files from distant/unrelated features.
+# 4. Summarize to a short paragraph: completed task blocks in tasks.json.
+# 5. Emit a `compression` event listing every file that was summarized,
+#    with original token count vs. summary token count.
+# Never truncate mid-file. Never silently drop content.
+# If even after full compression the context still exceeds budget,
+# emit a `compression_failure` event and halt the subtask with a clear error.
+
+# ── MEMORY NOTE ───────────────────────────────────────────────────────────
+# These budgets do NOT change how much memory a model loads — that is set by
+# config.yaml's num_ctx (the KV-cache size). The budgets only decide how much of
+# the window is filled with input vs. left for output. To cut memory, lower num_ctx
+# (and these budgets to match); to cut model weight size, pick smaller models.

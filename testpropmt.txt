@@ -1,0 +1,24 @@
+Build a simple Notes application with the following requirements:
+
+Backend (Python):
+- FastAPI REST API
+- SQLite database for persistence
+- Endpoints: GET /api/notes, POST /api/notes, GET /api/notes/{id}, PUT /api/notes/{id}, DELETE /api/notes/{id}
+- Each note has: id, title, content, created_at, updated_at
+- Basic validation: title max 100 chars, content max 5000 chars
+- Run on http://localhost:8000
+
+Frontend (React + TypeScript):
+- Clean, minimal UI with a dark theme
+- Display list of all notes
+- Form to create new notes (title + content)
+- Edit existing notes inline
+- Delete notes with confirmation
+- Show created/updated timestamps
+- Run on http://localhost:5173
+
+Project structure:
+- /backend - Python FastAPI code
+- /frontend - React TypeScript code
+
+The build should create a working, testable application with unit tests for the backend and integration tests for the API.

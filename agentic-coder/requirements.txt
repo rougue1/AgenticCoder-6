@@ -1,0 +1,16 @@
+# AIForge — local autonomous coding pipeline (Python 3.11+)
+# Pinned to lower bounds; the shipped .venv has these installed.
+
+litellm>=1.40            # unified OpenAI-style interface to Ollama (and others)
+fastapi>=0.110           # SSE event server + control endpoints
+uvicorn>=0.27            # ASGI server for FastAPI
+sse-starlette>=2.0       # (optional) SSE helpers; manual StreamingResponse also used
+jinja2>=3.1              # prompt templating
+pyyaml>=6.0              # config.yaml / context_budget.yaml
+rich>=13.0               # live CLI rendering
+httpx>=0.27              # SSE client (renderer) + control calls (main.py)
+tiktoken>=0.6            # token estimation for budgets/compression
+jsonschema>=4.0          # (optional) validation of generated structures
+
+# ── dev / test ────────────────────────────────────────────────────────────────
+pytest>=8.0              # functional test-suite (tests/); e2e is opt-in (AIFORGE_E2E=1)
