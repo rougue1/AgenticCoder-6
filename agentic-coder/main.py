@@ -19,7 +19,8 @@ prompt in a file and pass ``-f``:
 Flags:
   -f, --prompt-file PATH   read the build prompt from a file (multi-line OK)
   --config PATH            alternate config.yaml
-  --budget PATH            alternate context_budget.yaml
+  --budget PATH            deprecated (context budgets are derived from the
+                           resolved model windows now); accepted and ignored
   --project-dir PATH       override the output project directory
   --resume                 resume an existing run (requires a known project_dir)
   --no-dump                disable per-call prompt/response dumps under .agent/llm_calls/
@@ -52,7 +53,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="read the build prompt from a file (best for long, multi-line prompts)",
     )
     p.add_argument("--config", default=None, help="path to config.yaml")
-    p.add_argument("--budget", default=None, help="path to context_budget.yaml")
+    p.add_argument("--budget", default=None, help="deprecated and ignored (budgets derive from resolved model windows)")
     p.add_argument("--project-dir", default=None, help="override the output project directory")
     p.add_argument("--resume", action="store_true", help="resume an existing run from disk")
     p.add_argument("--no-dump", action="store_true", help="disable LLM prompt/response dumps")
@@ -89,9 +90,11 @@ def main(argv: list[str] | None = None) -> int:
         print("  python main.py -f prompt.txt", file=sys.stderr)
         return 2
 
+    if args.budget:
+        print("note: --budget is deprecated and ignored (budgets derive from the resolved model windows)", file=sys.stderr)
+
     config = load_config(
         args.config,
-        args.budget,
         project_dir_override=args.project_dir,
         dump_llm_calls=False if args.no_dump else None,
     )
@@ -141,7 +144,10 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         server.shutdown()
 
-    return 0 if result.get("result") in (None, "done") else 1
+    # Only a clean pipeline.complete(result=done) is success; a cancelled run
+    # (pipeline.cancelled carries no "result" the renderer records) and an
+    # error both exit non-zero.
+    return 0 if result.get("result") == "done" else 1
 
 
 class _ServerThread(threading.Thread):

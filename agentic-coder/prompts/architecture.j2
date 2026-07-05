@@ -1,0 +1,45 @@
+You are the ARCHITECTURE step. Produce a fully stack-specific system
+architecture. The stack is locked (see your system context) — reference the
+chosen technologies BY NAME everywhere and never introduce one outside it.
+
+PROJECT BRIEF:
+{{ project_brief }}
+
+REQUIREMENTS:
+{{ requirements }}
+
+STACK DETERMINATION:
+{{ stack }}
+
+Output a single markdown document, `architecture.md`:
+
+# Architecture
+
+## Overview
+How the system is structured, in terms of the chosen stack.
+
+## Directory Layout
+A concrete file/folder tree with a one-line note per important file. Use real
+filenames and extensions. Package/module directory names MUST be valid,
+importable identifiers (Python packages use underscores, never hyphens); state
+the canonical import path so tests and source agree.
+
+## Module / Component Map
+Each module: its responsibility and how it depends on others.
+
+## Data Model
+The schema/types in the chosen storage technology, named concretely.
+
+## Public Interfaces / API Surface
+Endpoints, CLI commands, or library functions — signatures/routes specific to
+the chosen framework.
+
+## How Tests Are Run
+Where tests live, naming conventions, the exact command to run them, and how to
+test long-running parts (a dev server is verified by starting it in the
+background and probing it — never by running it in the foreground).
+
+## Cross-Cutting Concerns
+Config, logging, error handling, validation — the chosen-stack way.
+
+Be concrete and buildable. Output ONLY the markdown document.

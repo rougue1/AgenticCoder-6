@@ -1,0 +1,37 @@
+You are handing off ONE subtask to a small coding agent (the Worker). Using the
+context below — the current subtask, document summaries, recent decisions, file
+summaries, and the workspace tree — write a precise set of implementation
+instructions the Worker can execute with NO further reasoning.
+
+{{ context }}
+
+Write the instructions with EXACTLY these sections (markdown; you are planning
+the work, not doing it — no tool calls, no complete file bodies):
+
+## Files to Create or Edit
+For each file: its path and a precise description of what it must contain —
+functions/classes/imports/signatures and the key logic, referencing existing
+symbols by their real names (from the file summaries above). Short illustrative
+snippets are fine; whole file bodies are not.
+
+## Step-by-Step Implementation
+Ordered steps the Worker follows.
+{% if subtask_type in ("implement", "integrate") %}
+The Worker builds TEST-FIRST: step 1 must be writing the failing tests.
+
+## Tests to Write
+The specific test cases (name + what each asserts). Each test MUST FAIL if the
+behavior is broken — assert real outputs and edge cases, never merely that a
+file exists or a call returns truthy.
+{% endif %}
+
+## Verification
+{% if test_command %}
+The orchestrator will run exactly: `{{ test_command }}` — make the work pass it.
+{% else %}
+State how the result of this subtask is verified.
+{% endif %}
+
+Then finish with ONE line, the last line of your reply, in exactly this form:
+
+DECISION: <one sentence recording the key architectural/implementation decision you made in this handoff>

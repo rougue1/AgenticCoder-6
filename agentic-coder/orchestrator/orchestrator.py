@@ -1,13 +1,16 @@
-"""Top-level pipeline state-machine driver (spec §7, §16, §18.7).
+"""Top-level pipeline driver (redesign).
 
-Wires the stages together: intake -> requirements -> stack -> architect -> sdd
--> task planning -> subtask loop -> review. Resolves the project directory
-(deriving the slug from intake when ``project_dir`` is blank), builds the service
-container once the workspace exists, drives each stage with start/end events,
-supports cooperative cancellation, and resumes an existing run from disk.
+Fresh run:  model resolution -> pre-flight -> Phase 1 (stack determination ->
+anchor -> environment -> .agentignore -> requirements -> architecture -> task
+planning + validation) -> Phase 2 (subtask loop) -> Phase 3 (final review).
 
-Designed to run in a worker thread (started by ``POST /start``); it publishes to
-the EventBus, which bridges back to the server's asyncio loop.
+Resume: model resolution re-runs from scratch (never persisted), then the
+hardening checks (anchor integrity, dependency re-validation, venv integrity,
+missing summaries re-generated, in_progress reset) before jumping straight to
+the subtask loop.
+
+Designed to run in a worker thread (started by ``POST /start``); it publishes
+to the EventBus, which bridges back to the server's asyncio loop.
 """
 
 from __future__ import annotations
@@ -17,24 +20,25 @@ import time
 import traceback
 from typing import Optional
 
+import yaml
+
 from config import AppConfig
+from environment import setup_environment, verify_venv
 from llm.client import LLMClient
+from llm.resolution import resolve_all
 from orchestrator.states import PipelineState, can_transition
 from orchestrator.subtask_loop import SubtaskLoop
+from preflight import run_preflight
 from server import events
 from server.events import EventBus
 from services import PipelineCancelled, Services
-from stages import (
-    architect,
-    intake,
-    requirements,
-    reviewer,
-    sdd_generator,
-    stack_decider,
-    task_planner,
-)
-from taskstore import TaskStore
-from workspace import Workspace
+from stackprofiles import StackProfile, default_profile, resolve_profile
+from stages import docs, final_review, manager, summarizer, task_planner
+from stages import stack as stack_stage
+from stages.stack import StackInfo
+from taskstore import DONE, PENDING, TaskStore
+from validation import validate_dependencies
+from workspace import Workspace, slug_from_prompt
 
 
 class Orchestrator:
@@ -76,12 +80,7 @@ class Orchestrator:
         self.pause_event.clear()  # don't let a paused run get stuck ignoring cancel
 
     def pause(self) -> bool:
-        """Cooperatively pause a running pipeline. Returns True if it took effect.
-
-        Sets a flag the worker honors at its next atomic boundary (after the
-        current tool call / LLM stream completes). No-op if nothing is running or
-        it is already paused.
-        """
+        """Cooperatively pause a running pipeline. Returns True if it took effect."""
         if not self.is_running() or self.pause_event.is_set():
             return False
         self.pause_event.set()
@@ -117,14 +116,9 @@ class Orchestrator:
                 pass
         return snap
 
-    # ── frontend-facing state (spec §Phase2 GET /project/state) ────────────────
+    # ── frontend-facing state (GET /project/state) ─────────────────────────────
     def active_workspace(self) -> Optional[Workspace]:
-        """The workspace the UI should read files/manifest from.
-
-        The live one if a run is (or was) in progress this session, otherwise one
-        built from a configured ``project_dir`` so an existing on-disk project can
-        be inspected/resumed before any run starts. ``None`` when neither exists.
-        """
+        """The workspace the UI should read files/manifest from."""
         if self.workspace is not None:
             return self.workspace
         pd = (self.config.project_dir or "").strip()
@@ -145,12 +139,8 @@ class Orchestrator:
         return None
 
     def derive_status(self) -> str:
-        """Coarse status the frontend switches views on.
-
-        idle | running | paused | done | blocked | error | cancelled.
-        ``blocked`` means "not running, but an on-disk run has unfinished work
-        that could be resumed" — what the launch screen offers a resume for.
-        """
+        """Coarse status a frontend switches views on:
+        idle | running | paused | done | blocked | error | cancelled."""
         if self.is_running():
             return "paused" if self.is_paused() else "running"
         if self.state == PipelineState.DONE:
@@ -190,6 +180,7 @@ class Orchestrator:
             "blocked_count": 0,
             "pending_count": 0,
             "in_progress_count": 0,
+            "decomposed_count": 0,
         }
         if ws is None or not ws.agent_doc_exists("tasks.json"):
             if ws is not None:
@@ -205,6 +196,7 @@ class Orchestrator:
         out["blocked_count"] = counts.get("blocked", 0)
         out["pending_count"] = counts.get("pending", 0)
         out["in_progress_count"] = counts.get("in_progress", 0)
+        out["decomposed_count"] = counts.get("decomposed", 0)
         out["subtask_total"] = store.total_subtasks()
         out["task_total"] = len(store.tasks)
         out["project_name"] = str(store.data.get("project") or out["project_name"])
@@ -231,7 +223,13 @@ class Orchestrator:
     def run(self, prompt: str, *, resume: bool = False) -> None:
         self.prompt = prompt
         self.started_at = time.monotonic()
+        self.bus.emit(events.PIPELINE_START, "pipeline", mode="resume" if resume else "fresh")
         try:
+            # MODEL CAPABILITY RESOLUTION — before pre-flight, once per run,
+            # never persisted (models can change between sessions).
+            with self._stage(PipelineState.RESOLUTION, "resolution", "Resolving model capabilities"):
+                self.services.set_runtime(resolve_all(self.config, self.bus))
+
             if resume:
                 self._resume()
             else:
@@ -239,46 +237,102 @@ class Orchestrator:
             self._finish()
         except PipelineCancelled:
             self._set_state(PipelineState.CANCELLED)
-            self.bus.emit(events.PIPELINE_COMPLETE, self.phase or "pipeline", result="cancelled", **self._summary())
+            self.bus.emit(events.PIPELINE_CANCELLED, self.phase or "pipeline", result="cancelled", **self._summary())
         except Exception as exc:  # noqa: BLE001 - surface everything as an error event
             self._set_state(PipelineState.ERROR)
             self.bus.error(str(exc), context=traceback.format_exc()[-2000:], phase=self.phase or "pipeline")
             self.bus.emit(events.PIPELINE_COMPLETE, self.phase or "pipeline", result="error", message=str(exc), **self._summary())
         finally:
             # Free the last warm model so nothing lingers in VRAM/RAM after a
-            # walk-away run (honors evict_on_model_switch; no-op when it's off).
+            # walk-away run (honors evict_on_model_switch; no-op when off).
             self.client.unload_all()
 
+    # ── fresh run: Phase 1 ─────────────────────────────────────────────────────
     def _fresh_run(self, prompt: str) -> None:
         tool_root = self.config.tool_root
 
-        # INTAKE — may need to run before the workspace exists (slug source).
-        if self.config.project_dir.strip():
-            self._attach(Workspace.resolve(self.config.project_dir, None, tool_root))
-            with self._stage(PipelineState.INTAKE, "intake", "Interpreting the request"):
-                res = intake.run(self.services, prompt)
-                self.workspace.write_agent_doc("project_brief.md", res.brief)
-        else:
-            with self._stage(PipelineState.INTAKE, "intake", "Interpreting the request"):
-                res = intake.run(self.services, prompt)
-                self._attach(Workspace.resolve("", res.slug, tool_root))
-                self.workspace.write_agent_doc("project_brief.md", res.brief)
-        self.bus.log(f"Project name: {res.project_name} (slug: {res.slug})", phase="intake")
+        # The workspace must exist BEFORE pre-flight (writability check), so the
+        # slug is derived programmatically from the prompt — no LLM involved.
+        slug = slug_from_prompt(prompt)
+        self._attach(Workspace.resolve(self.config.project_dir, slug, tool_root))
 
+        with self._stage(PipelineState.PREFLIGHT, "preflight", "Pre-flight validation"):
+            run_preflight(self.config, self.workspace, default_profile(self.config.sandbox.stack_profile), self.bus)
+
+        # Step 1+2 — stack determination, project brief, the immutable anchor.
+        with self._stage(PipelineState.STACK, "stack", "Determining the stack + anchor"):
+            info = stack_stage.run(self.services, prompt)
+            self.services.stack = info
+            stack_stage.write_project_brief(self.services, prompt, info)
+            self._write_anchor(prompt, info)
+            profile = resolve_profile(self.config.sandbox.stack_profile, info.stack_name)
+            self._configure_sandbox(profile, info.allowed_commands)
+            self.bus.log(f"stack locked: {info.stack_name} (profile: {profile.name})", phase="stack")
+
+        # Step 3+4 — environment setup (orchestrator-side) + .agentignore.
+        with self._stage(PipelineState.ENVIRONMENT, "environment", "Setting up the environment"):
+            env = setup_environment(self.workspace, profile, self.bus, preferred_python=info.python_version)
+            self.services.environment = env
+            self._apply_env_to_sandbox(env)
+            self.workspace.write_agentignore(profile.default_agentignore + info.agentignore)
+
+        # Step 5 — requirements (+ Analyst summary for future handoffs).
         with self._stage(PipelineState.REQUIREMENTS, "requirements", "Deriving requirements"):
-            requirements.run(self.services)
-        with self._stage(PipelineState.STACK, "stack_decider", "Choosing the stack"):
-            stack_decider.run(self.services)
-        with self._stage(PipelineState.ARCHITECT, "architect", "Designing the architecture"):
-            architect.run(self.services)
-        with self._stage(PipelineState.SDD, "sdd_generator", "Writing the SDD + steering"):
-            sdd_generator.run(self.services)
+            docs.run_requirements(self.services)
+            summarizer.summarize_doc(self.services, "requirements.md")
+
+        # Step 6 — architecture (+ Analyst summary).
+        with self._stage(PipelineState.ARCHITECTURE, "architecture", "Designing the architecture"):
+            docs.run_architecture(self.services)
+            summarizer.summarize_doc(self.services, "architecture.md")
+
+        # Step 7+8 — task planning with schema + cycle validation (2 corrections).
         with self._stage(PipelineState.TASK_PLANNING, "task_planner", "Planning tasks & subtasks"):
             store = task_planner.run(self.services)
-            self.bus.log(f"Planned {store.total_subtasks()} subtasks across {len(store.tasks)} tasks", phase="task_planner")
+            self.bus.log(
+                f"planned {store.total_subtasks()} subtasks across {len(store.tasks)} tasks",
+                phase="task_planner",
+            )
 
         self._run_loop_and_review()
 
+    # ── the anchor (Step 2) ─────────────────────────────────────────────────────
+    def _write_anchor(self, prompt: str, info: StackInfo) -> None:
+        """Programmatic concatenation: prompt + stack determination -> anchor.
+
+        Written exactly once; the workspace layer hard-rejects any rewrite."""
+        combined = (
+            "You are the Manager of an autonomous build pipeline: a pragmatic staff "
+            "engineer. Everything you plan, hand off, or review MUST stay inside the "
+            "locked stack below. Never use git. Be concrete and decisive.\n\n"
+            f"## Original Request\n\n{prompt.strip()}\n\n"
+            f"## Stack Determination (locked)\n\n{info.raw_output.strip()}"
+        )
+        frontmatter = yaml.safe_dump(
+            {
+                "original_prompt": prompt,
+                "stack": info.stack_name,
+                "combined_anchor": combined,
+            },
+            sort_keys=False,
+            allow_unicode=True,
+            width=100000,
+        )
+        self.workspace.write_agent_doc("anchor.md", f"---\n{frontmatter}---\n\n{combined}\n")
+        self.bus.log("anchor.md written (immutable from now on)", phase="stack")
+
+    def _configure_sandbox(self, profile: StackProfile, manager_commands: list[str]) -> None:
+        allowed = list(dict.fromkeys(profile.base_allowed_commands + manager_commands))
+        self.services.sandbox.set_allowed_commands(allowed)
+        self.bus.log(f"sandbox allowlist: {len(allowed)} commands", phase="stack")
+
+    def _apply_env_to_sandbox(self, env) -> None:
+        if env.venv_path is not None:
+            self.services.sandbox.set_venv(env.venv_path)
+        if env.node_root is not None:
+            self.services.sandbox.set_node_bin(env.node_root)
+
+    # ── resume (hardened) ───────────────────────────────────────────────────────
     def _resume(self) -> None:
         tool_root = self.config.tool_root
         if not self.config.project_dir.strip():
@@ -287,20 +341,87 @@ class Orchestrator:
         if not ws.agent_doc_exists("tasks.json"):
             raise ValueError(f"cannot resume: no tasks.json found in {ws.agent_dir}")
         self._attach(ws)
+
+        # 1. Anchor integrity: must exist and parse with the required fields.
+        anchor_meta, anchor_body = _parse_anchor(ws)
+        info = _stack_info_from_anchor(anchor_meta, anchor_body)
+        self.services.stack = info
+
+        profile = resolve_profile(self.config.sandbox.stack_profile, info.stack_name)
+        with self._stage(PipelineState.PREFLIGHT, "preflight", "Pre-flight validation (resume)"):
+            run_preflight(self.config, ws, profile, self.bus)
+        self._configure_sandbox(profile, info.allowed_commands)
+
         store = TaskStore.load(ws)
+
+        # 2. Re-validate the dependency graph (manual edits can introduce cycles).
+        dep_errors = validate_dependencies(store.all_subtasks())
+        if dep_errors:
+            raise ValueError(
+                "cannot resume: tasks.json failed dependency validation:\n  - " + "\n  - ".join(dep_errors)
+            )
+
+        # 3. Venv integrity: recreate if broken and re-run done install subtasks.
+        if profile.uses_venv:
+            venv_ok = verify_venv(ws)
+            env = setup_environment(self.workspace, profile, self.bus, preferred_python=info.python_version)
+            self.services.environment = env
+            self._apply_env_to_sandbox(env)
+            if not venv_ok:
+                rerun = [
+                    sub["id"]
+                    for _, sub in store.subtasks()
+                    if sub.get("status") == DONE and str(sub.get("type") or "").lower() == "install"
+                ]
+                for sid in rerun:
+                    store.set_status(sid, PENDING)
+                if rerun:
+                    self.bus.log(
+                        f"venv was missing/broken — recreated it and re-queued install subtask(s): "
+                        + ", ".join(rerun),
+                        phase="resume",
+                        level="warn",
+                    )
+        self.services.manifest.forget_missing()
+
+        # 4. Summaries must exist for every done subtask; re-run Step C if not.
+        self._backfill_summaries(store)
+
+        # 5. Reset any in_progress subtasks back to pending.
         reset = store.reset_in_progress()
-        self.bus.log(f"Resuming run in {ws.root} ({reset} in-progress subtask(s) reset to pending)", phase="resume")
+        self.bus.log(f"resuming run in {ws.root} ({reset} in-progress subtask(s) reset to pending)", phase="resume")
+
         self._run_loop_and_review()
 
+    def _backfill_summaries(self, store: TaskStore) -> None:
+        for _, sub in store.subtasks():
+            if sub.get("status") != DONE:
+                continue
+            existing_files = [
+                f for f in (sub.get("files") or []) if self.workspace.file_exists(str(f))
+            ]
+            missing = [f for f in existing_files if not self.services.summaries.exists(str(f))]
+            if missing:
+                self.bus.log(
+                    f"re-running Step C for {sub.get('id')}: {len(missing)} missing summar(ies)",
+                    phase="resume",
+                )
+                summarizer.summarize_files(self.services, str(sub.get("id")), [str(f) for f in missing])
+        for doc in self.config.context.always_include:
+            if self.workspace.agent_doc_exists(doc) and not self.services.summaries.exists(doc):
+                summarizer.summarize_doc(self.services, doc)
+
+    # ── Phase 2 + 3 ─────────────────────────────────────────────────────────────
     def _run_loop_and_review(self) -> None:
         with self._stage(PipelineState.SUBTASK_LOOP, "subtask_loop", "Implementing subtasks"):
             loop_result = SubtaskLoop(self.services).run()
             self.bus.log(
-                f"Subtask loop finished: {loop_result.done} done, {loop_result.blocked} blocked",
+                f"subtask loop finished: {loop_result.done} done, {loop_result.blocked} blocked, "
+                f"{loop_result.decomposed} decomposed",
                 phase="subtask_loop",
             )
-        with self._stage(PipelineState.REVIEW, "reviewer", "Final review pass"):
-            reviewer.run(self.services)
+        with self._stage(PipelineState.FINAL_REVIEW, "final_review", "Final review (read-only)"):
+            final_review.run(self.services)
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _attach(self, ws: Workspace) -> None:
@@ -308,7 +429,7 @@ class Orchestrator:
         self.workspace = ws
         self.services.attach_workspace(ws)
         self.bus.set_log_path(ws.agent_path("run.log"))
-        self.bus.log(f"Project directory: {ws.root}", phase="setup")
+        self.bus.log(f"project directory: {ws.root}", phase="setup")
 
     def _finish(self) -> None:
         self._set_state(PipelineState.DONE)
@@ -335,7 +456,7 @@ class Orchestrator:
 
 
 class _StageCtx:
-    """Context manager: set state, emit stage_start/stage_end, honor cancel."""
+    """Context manager: set state, emit stage.start/stage.end, honor cancel."""
 
     def __init__(self, orch: Orchestrator, state: PipelineState, phase: str, title: str):
         self.orch = orch
@@ -351,17 +472,48 @@ class _StageCtx:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        # Always emit stage_end (note failure if one occurred); don't suppress.
+        # Always emit stage.end (noting failure if one occurred); don't suppress.
         self.orch.bus.stage_end(self.phase, ok=exc_type is None)
         return False
 
 
-def _locate_current(flat: list, tracked_id: str, store: "TaskStore") -> Optional[int]:
-    """Index (into the flat (task, sub) list) of the subtask to report as current.
+# ── anchor parsing (resume hardening) ───────────────────────────────────────────
+def _parse_anchor(ws: Workspace) -> tuple[dict, str]:
+    raw = ws.read_agent_doc("anchor.md")
+    if not raw:
+        raise ValueError("cannot resume: .agent/anchor.md is missing — the anchor is required")
+    if not raw.startswith("---"):
+        raise ValueError("cannot resume: anchor.md has no YAML frontmatter")
+    parts = raw.split("---", 2)
+    if len(parts) < 3:
+        raise ValueError("cannot resume: anchor.md frontmatter is malformed (unterminated ---)")
+    try:
+        meta = yaml.safe_load(parts[1])
+    except yaml.YAMLError as exc:
+        raise ValueError(f"cannot resume: anchor.md frontmatter is not valid YAML: {exc}") from exc
+    if not isinstance(meta, dict):
+        raise ValueError("cannot resume: anchor.md frontmatter is not a YAML mapping")
+    missing = [k for k in ("original_prompt", "stack", "combined_anchor") if not meta.get(k)]
+    if missing:
+        raise ValueError(f"cannot resume: anchor.md frontmatter is missing required field(s): {', '.join(missing)}")
+    return meta, parts[2].strip()
 
-    Preference order: the one the loop says it's on -> any in_progress on disk ->
-    the next runnable -> the last one (so a finished run reads as 100%).
-    """
+
+def _stack_info_from_anchor(meta: dict, body: str) -> StackInfo:
+    """Reconstruct the stack determination (incl. allowed_commands) from the
+    anchor body — the determination output is embedded there verbatim."""
+    from llm.tool_parser import extract_json
+
+    info = StackInfo(stack_name=str(meta.get("stack") or "python-fastapi"), raw_output=body)
+    data = extract_json(body)
+    if isinstance(data, dict):
+        info.python_version = str(data.get("python_version") or "").strip()
+        info.allowed_commands = [str(c).strip() for c in (data.get("allowed_commands") or []) if str(c).strip()]
+    return info
+
+
+def _locate_current(flat: list, tracked_id: str, store: "TaskStore") -> Optional[int]:
+    """Index (into the flat (task, sub) list) of the subtask to report as current."""
     if not flat:
         return None
     if tracked_id:

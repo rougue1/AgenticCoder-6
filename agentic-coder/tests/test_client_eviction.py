@@ -8,6 +8,7 @@ import types
 
 from config import load_config
 from llm.client import CompletionResult, LLMClient
+from llm.resolution import RuntimeModelConfig
 
 
 class _FakePS:
@@ -27,10 +28,25 @@ def _patch_http(monkeypatch, unloaded: list):
     monkeypatch.setattr("llm.client.httpx.post", _post)
 
 
+def _runtime(model: str, tier: str) -> RuntimeModelConfig:
+    return RuntimeModelConfig(
+        tier=tier,
+        model=model,
+        reported_num_ctx=8192,
+        num_ctx=8192,
+        max_tokens=4096,
+        context_window_pct=0.5,
+        temperature=0.1,
+        use_thinking=False,
+        thinking_enabled=False,
+        supports_think_param=False,
+    )
+
+
 def _client(bus):
     cfg = load_config()
-    cfg.models = {"planner": "ollama/big-a:1", "implementer": "ollama/big-b:1"}
     c = LLMClient(cfg, bus)
+    c.set_runtime({"manager": _runtime("big-a:1", "manager"), "worker": _runtime("big-b:1", "worker")})
     c._stream = lambda *a, **k: CompletionResult(text="ok", raw="ok")  # no litellm
     return c, cfg
 
@@ -40,11 +56,11 @@ def test_evicts_only_on_model_switch(monkeypatch, bus):
     _patch_http(monkeypatch, unloaded)
     c, _ = _client(bus)
 
-    c.complete("planner", [{"role": "user", "content": "hi"}])  # first load, nothing to evict
-    c.complete("planner", [{"role": "user", "content": "hi"}])  # SAME model -> stays warm
+    c.complete("manager", "phase", [{"role": "user", "content": "hi"}])  # first load, nothing to evict
+    c.complete("manager", "phase", [{"role": "user", "content": "hi"}])  # SAME model -> stays warm
     assert unloaded == []
 
-    c.complete("implementer", [{"role": "user", "content": "hi"}])  # switch -> evict the planner model
+    c.complete("worker", "phase", [{"role": "user", "content": "hi"}])  # switch -> evict the manager model
     assert unloaded == ["big-a:1"]
 
     c.unload_all()  # end of run -> free the last model
@@ -55,9 +71,9 @@ def test_no_eviction_when_disabled(monkeypatch, bus):
     unloaded: list = []
     _patch_http(monkeypatch, unloaded)
     c, cfg = _client(bus)
-    cfg.evict_on_model_switch = False
+    cfg.ollama.evict_on_model_switch = False
 
-    c.complete("planner", [{"role": "user", "content": "hi"}])
-    c.complete("implementer", [{"role": "user", "content": "hi"}])
+    c.complete("manager", "phase", [{"role": "user", "content": "hi"}])
+    c.complete("worker", "phase", [{"role": "user", "content": "hi"}])
     c.unload_all()
     assert unloaded == []  # big-box mode: model stacking allowed, nothing force-evicted

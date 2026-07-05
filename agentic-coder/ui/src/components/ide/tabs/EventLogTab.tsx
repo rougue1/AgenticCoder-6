@@ -5,16 +5,16 @@ import type { LogRow } from '../../../types'
 
 const TYPE_COLOR: Record<string, string> = {
   error: 'text-vs-red',
-  blocked: 'text-vs-red',
-  subtask_failed: 'text-vs-red',
-  test_run: 'text-vs-yellow',
-  tool_call: 'text-vs-blue',
+  'task.blocked': 'text-vs-red',
+  'worker.fix_attempt': 'text-vs-red',
+  'test.run': 'text-vs-yellow',
+  'worker.tool_call': 'text-vs-blue',
   file_written: 'text-vs-green',
-  subtask_done: 'text-vs-green',
-  pipeline_complete: 'text-vs-green',
-  escalation: 'text-vs-orange',
-  pipeline_paused: 'text-vs-orange',
-  stage_start: 'text-vs-purple',
+  'task.done': 'text-vs-green',
+  'pipeline.complete': 'text-vs-green',
+  'task.escalated': 'text-vs-orange',
+  'pipeline.paused': 'text-vs-orange',
+  'stage.start': 'text-vs-purple',
 }
 
 export function EventLogTab() {

@@ -52,14 +52,15 @@ export function useEventStream() {
       // Refresh the rich snapshot at the transitions that change the phase
       // badge / progress (activity isn't carried on the SSE stream itself).
       if (
-        ev.type === 'subtask_start' ||
-        ev.type === 'subtask_done' ||
-        ev.type === 'subtask_failed' ||
-        ev.type === 'blocked' ||
-        ev.type === 'escalation' ||
-        ev.type === 'test_run' ||
-        ev.type === 'stage_start' ||
-        ev.type === 'pipeline_complete'
+        ev.type === 'task.start' ||
+        ev.type === 'task.done' ||
+        ev.type === 'worker.fix_attempt' ||
+        ev.type === 'task.blocked' ||
+        ev.type === 'task.escalated' ||
+        ev.type === 'test.run' ||
+        ev.type === 'stage.start' ||
+        ev.type === 'pipeline.complete' ||
+        ev.type === 'pipeline.cancelled'
       ) {
         refreshState()
       }

@@ -1,21 +1,17 @@
-"""File manifest + raw directory listing (spec §10).
+"""The Worker-written file manifest (redesign).
 
-Maintains two files under ``.agent/`` and keeps them in sync after every write:
+Records every file the Worker writes/patches, with the one-line summary the
+``write_file`` call supplied. This is the source of the **manifest-filtered
+file tree** the Manager sees in every handoff: only Worker-written files appear
+— never ``.agent/``, never the environment dirs, never ``.agentignore`` matches.
 
-* ``file-directory.txt`` — a filtered, recursive ``ls -R``-style listing (the
-  ground-truth list of what exists, excluding noise dirs like ``node_modules``).
-* ``file_manifest.md`` — an *annotated* tree where each generated file carries
-  the one-line ``summary`` recorded at creation time, giving the planner
-  semantic awareness without having to ``read_file`` everything.
-
-Summaries are persisted to ``.agent/manifest.json`` so they survive resumes.
+Persisted as ``.agent/manifest.json`` (an internal sidecar; the durable
+per-file knowledge base is ``.agent/summaries/``) so the tree survives resume.
 """
 
 from __future__ import annotations
 
 import json
-import os
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from workspace import Workspace
@@ -23,17 +19,6 @@ from workspace import Workspace
 if TYPE_CHECKING:
     from server.events import EventBus
 
-# Directories never shown in the listing/manifest (build artefacts & VCS noise).
-# Build/VCS/dependency noise. Deliberately conservative: ambiguous names like
-# bin/obj/out are NOT excluded, so the listing never hides real user code.
-EXCLUDE_DIRS = {
-    ".git", ".agent", "node_modules", "dist", "build", "__pycache__", ".venv",
-    "venv", ".env", ".pytest_cache", ".mypy_cache", ".ruff_cache", "target",
-    ".next", ".nuxt", ".svelte-kit", "coverage", ".gradle", ".idea", ".vscode",
-    "vendor", ".cache", ".turbo", ".parcel-cache",
-}
-# Individual files excluded from the listing (lockfile noise etc.).
-EXCLUDE_FILES = {".DS_Store"}
 _SIDE_CAR = "manifest.json"
 
 
@@ -41,7 +26,7 @@ class Manifest:
     def __init__(self, workspace: Workspace, bus: "EventBus | None" = None):
         self.workspace = workspace
         self.bus = bus
-        self.summaries: dict[str, str] = {}
+        self.entries: dict[str, str] = {}  # rel path -> one-line summary
         self.load()
 
     # ── persistence ───────────────────────────────────────────────────────────
@@ -49,80 +34,53 @@ class Manifest:
         path = self.workspace.agent_path(_SIDE_CAR)
         if path.exists():
             try:
-                self.summaries = json.loads(path.read_text(encoding="utf-8"))
+                data = json.loads(path.read_text(encoding="utf-8"))
+                self.entries = {str(k): str(v or "") for k, v in data.items()} if isinstance(data, dict) else {}
             except (json.JSONDecodeError, OSError):
-                self.summaries = {}
+                self.entries = {}
 
-    def _save_sidecar(self) -> None:
-        self.workspace.write_agent_doc(_SIDE_CAR, json.dumps(self.summaries, indent=2, sort_keys=True))
+    def _save(self) -> None:
+        self.workspace.write_agent_doc(_SIDE_CAR, json.dumps(self.entries, indent=2, sort_keys=True))
 
     # ── recording ─────────────────────────────────────────────────────────────
     def record(self, rel_path: str, summary: str | None) -> None:
-        """Record/refresh a file's one-line summary and regenerate both files."""
+        """Record/refresh a Worker-written file and its one-line summary."""
         key = self.workspace.relative(rel_path)
         if summary:
-            self.summaries[key] = summary.strip().replace("\n", " ")
-        elif key not in self.summaries:
-            self.summaries[key] = ""
-        self._save_sidecar()
-        self.regenerate()
+            self.entries[key] = str(summary).strip().replace("\n", " ")
+        elif key not in self.entries:
+            self.entries[key] = ""
+        self._save()
 
+    def forget_missing(self) -> None:
+        """Drop entries whose files no longer exist on disk (resume hygiene)."""
+        stale = [rel for rel in self.entries if not self.workspace.file_exists(rel)]
+        for rel in stale:
+            del self.entries[rel]
+        if stale:
+            self._save()
+
+    # ── views ─────────────────────────────────────────────────────────────────
     def describe(self, rel_path: str) -> str:
-        return self.summaries.get(self.workspace.relative(rel_path), "")
+        return self.entries.get(self.workspace.relative(rel_path), "")
 
-    # ── generation ────────────────────────────────────────────────────────────
-    def regenerate(self) -> None:
-        files = self._walk()
-        self.workspace.write_agent_doc("file-directory.txt", self._render_directory(files))
-        self.workspace.write_agent_doc("file_manifest.md", self._render_manifest(files))
+    def paths(self) -> list[str]:
+        return sorted(self.entries)
 
-    def _walk(self) -> list[str]:
-        """Return all project-relative file paths, filtered, sorted."""
-        results: list[str] = []
-        root = self.workspace.root
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDE_DIRS and not _is_hidden_noise(d))
-            rel_dir = Path(dirpath).relative_to(root)
-            for fname in sorted(filenames):
-                if fname in EXCLUDE_FILES:
-                    continue
-                rel = (rel_dir / fname).as_posix()
-                if rel.startswith(".agent/"):
-                    continue
-                results.append(rel)
-        return sorted(results)
+    def file_tree(self) -> str:
+        """The manifest-filtered tree (Worker-written files only)."""
+        return self.workspace.file_tree(self.paths())
 
-    def _render_directory(self, files: list[str]) -> str:
-        header = f"# Project file listing for {self.workspace.root.name}\n# (excludes build/VCS noise; ground truth of what exists)\n\n"
-        if not files:
-            return header + "(no files yet)\n"
-        lines = []
-        last_dir = object()
-        for rel in files:
-            parent = str(Path(rel).parent)
-            if parent != last_dir:
-                last_dir = parent
-                if parent != ".":
-                    lines.append(f"{parent}/")
-            indent = "  " if parent != "." else ""
-            lines.append(f"{indent}{Path(rel).name}")
-        return header + "\n".join(lines) + "\n"
-
-    def _render_manifest(self, files: list[str]) -> str:
+    def render_markdown(self) -> str:
+        """Annotated manifest for humans / the ``/project/manifest`` endpoint."""
         header = (
             f"# File Manifest — {self.workspace.root.name}\n\n"
-            "Annotated tree. Each line: `path — one-line description`. "
-            "Use `read_file` when a one-liner isn't enough.\n\n"
+            "Files written by the Worker. Each line: `path — one-line description`.\n\n"
         )
-        if not files:
-            return header + "_(no files yet)_\n"
-        lines = []
-        for rel in files:
-            desc = self.summaries.get(rel, "")
-            lines.append(f"- `{rel}`" + (f" — {desc}" if desc else ""))
-        return header + "\n".join(lines) + "\n"
-
-
-def _is_hidden_noise(name: str) -> bool:
-    # Keep meaningful dotfiles/dirs (e.g. .github) but drop obvious caches.
-    return name in EXCLUDE_DIRS
+        matcher = self.workspace.ignore_matcher()
+        lines = [
+            f"- `{rel}`" + (f" — {desc}" if desc else "")
+            for rel, desc in sorted(self.entries.items())
+            if not matcher.is_ignored(rel)
+        ]
+        return header + ("\n".join(lines) + "\n" if lines else "_(no files yet)_\n")

@@ -1,121 +1,100 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║ THIS FILE IS THE SINGLE SOURCE OF TRUTH.                                        ║
-# ║ The models (and every setting) chosen here OVERRIDE everything else — the       ║
-# ║ DEFAULT_MODELS in config.py, any example in README.md, and the (older) example  ║
-# ║ config in agentic-coder.md. Those are fallbacks/illustrations only. If you want ║
-# ║ to change which model runs a phase, change it HERE. A phase omitted here falls  ║
-# ║ back to config.py:DEFAULT_MODELS; an unknown top-level key is warned about on    ║
-# ║ startup.                                                                         ║
+# ║ AIForge configuration — SINGLE SOURCE OF TRUTH (two-tier redesign).             ║
+# ║                                                                                  ║
+# ║ Two model tiers run the whole pipeline:                                          ║
+# ║   manager — plans, architects, hands off, escalates, decomposes, summarizes.     ║
+# ║   worker  — implements + fixes in a tight tool-calling loop.                     ║
+# ║                                                                                  ║
+# ║ You only ever need to edit: model, temperature, context_window_pct,              ║
+# ║ max_tokens_override, use_thinking. Everything else about a model (its true       ║
+# ║ context window, its effective token budget, whether thinking actually works)     ║
+# ║ is resolved automatically at startup from Ollama /api/show + a capability        ║
+# ║ probe, into a RuntimeModelConfig all downstream code reads.                      ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-# Leave project_dir blank to use the default AgenticCoder-6/sandbox/<slug>/
-# (resolved as <tool_root>/../sandbox/<slug>, anchored on main.py's location —
-#  works no matter which directory you launch the tool from).
-project_dir: ""
-
-ollama_base_url: "http://localhost:11434"
-
-# ── HARDWARE PROFILE (tuned for ~16GB VRAM + 32GB RAM) ──────────────────────────
-# The strongest installed models that fit this box (no 70b). Peak memory is one
-# model + its KV cache at a time; keep_alive keeps the ACTIVE model warm across a
-# phase's tool loop, and Ollama evicts it when a different phase needs the room.
-# Scaling:
-#   * smaller box (8-16GB RAM) -> drop to qwen3:8b / qwen2.5-coder:7b, num_ctx 8192-16384.
-#   * bigger box / more VRAM    -> raise num_ctx (+ the context_budget.yaml budgets).
-
-# How long Ollama keeps a model loaded after a call. "5m" keeps the active model
-# warm so the per-subtask implement/fix loop doesn't pay a multi-GB reload on every
-# call. Set 0 to unload immediately after every call (only if RAM is very tight and
-# you'd rather reload than risk stacking).
-keep_alive: "5m"
-
-# ── MODEL MEMORY POLICY (prevents the 27B->30B swap OOM / "EOF") ────────────────
-# true  (default, right for <=16GB VRAM): never keep two DIFFERENT models resident.
-#       Before a phase loads a different model than the one currently warm, the tool
-#       unloads the warm one first — so the planner (27B) and implementer (30B) can't
-#       stack and OOM-kill the Ollama runner. A model re-called consecutively (the
-#       implement/fix loop, same model) stays warm; load time between *different*
-#       models is paid deliberately (fine for "code and walk away").
-# false: allow stacking (only set this if you upgrade to enough VRAM/RAM to hold two
-#       models at once).
-evict_on_model_switch: true
-
-# The context window each request asks Ollama for. This sizes the KV cache, which
-# Ollama allocates AT LOAD TIME. 32768 is a strong window that still fits the
-# largest model here (~18GB) inside 32GB RAM. Set your Ollama server's
-# OLLAMA_CONTEXT_LENGTH to at least this value so it isn't silently capped lower.
-# (OLLAMA_KV_CACHE_TYPE=q8_0 roughly halves the cache if you want to push higher.)
-num_ctx: 32768
-
 models:
-    # ── REASONING / PLANNING PHASES ────────────────────────────────────────────
-    # qwen3.6:27b (~17GB): the strongest installed reasoner that still fits VRAM
-    # mostly on-GPU. Thinking is auto-enabled for the qwen3 family (see below).
-    architect: "ollama/qwen3.6:27b"
-    sdd_generator: "ollama/qwen3.6:27b"
-    requirements: "ollama/qwen3.6:27b"
-    stack_decider: "ollama/qwen3.6:27b"
-    task_planner: "ollama/qwen3.6:27b"
+  manager:
+    # Discovered via `ollama list` on this machine: ornith:35b (qwen3.5-MoE 34.7B
+    # Q4_K_M, ~21GB) — the strongest installed reasoner. Thinking-capable.
+    model: "ornith:35b"
+    temperature: 0.3
+    # Fraction of the resolved context window reserved for INPUT (prompt) tokens;
+    # the remainder is the model's room to answer/think.
+    context_window_pct: 0.75
+    # Set a number to hard-override the computed max_tokens; null = derive it as
+    # int(num_ctx * context_window_pct) at startup.
+    max_tokens_override: null
+    use_thinking: true
+  worker:
+    # ornith:latest (qwen3.5 9B Q4_K_M, ~5.6GB) — small + fast for the tool loop.
+    model: "ornith:latest"
+    temperature: 0.1
+    context_window_pct: 0.55
+    max_tokens_override: null
+    # NOTE: the worker NEVER thinks regardless of this flag — a hardcoded
+    # architectural override (deliberation burns tokens in a tight tool loop with
+    # no quality benefit). Setting true here only earns you a startup warning.
+    use_thinking: false
 
-    # ── PER-SUBTASK PLANNER + ESCALATION (run every loop) ──────────────────────
-    planner: "ollama/qwen3.6:27b"
-    escalation: "ollama/qwen3.6:27b"
+pipeline:
+  max_fix_retries: 3      # worker fix attempts per plan before escalating
+  max_escalations: 2      # manager re-plans per subtask before decomposition
+  max_decompositions: 1   # decomposition events per subtask before hard block
+  tdd_hard_fail: true     # true: impl-before-test after 3 corrections = failed attempt
+                          # false: log a warning and let the worker proceed untested
 
-    # ── CODING PHASES (run most frequently — the workhorse) ────────────────────
-    # qwen3-coder:30b (~18GB): the strongest installed coder. There is no separate
-    # `tester` phase — the implementer writes its own tests in the same conversation
-    # (it has the context of what it just implemented).
-    implementer: "ollama/qwen3-coder:30b"
+sandbox:
+  timeout: 60             # seconds per foreground command
+  long_process_timeout: 30 # seconds to wait for a background server to become healthy
+  stack_profile: auto     # auto | python | node — base command allowlist + env strategy
 
-    # ── TOOL CALLER (the tool-call router / salvage model) ─────────────────────
-    # Invoked whenever a phase's output carries tool intent in the wrong format —
-    # it re-expresses that work as clean tool calls (incl. multiple files). Wants
-    # to be fast AND faithful at reproducing content, so a 14b coder, not a 3b.
-    tool_caller: "ollama/qwen2.5-coder:14b"
-
-    # ── INTAKE (trivial classification — keep it tiny and instant) ─────────────
-    intake: "ollama/llama3.2:3b"
-
-    # ── FINAL REVIEW (reuses the coder so it stays warm) ───────────────────────
-    reviewer: "ollama/qwen3-coder:30b"
-
-# ── THINKING IS AUTO-DETECTED ─────────────────────────────────────────────────
-# You do NOT need to maintain these lists. By default each phase's thinking mode
-# is inferred from its model (config.detect_thinking_mode): the qwen3 family gets
-# /think, DeepSeek-R1 thinks on its own, everything else runs with no thinking.
-# Change a model above and its thinking follows automatically.
-#
-# These groups are OPTIONAL OVERRIDES — only list a phase here to force a specific
-# mode against the auto-default (e.g. silence a slow coder's thinking for speed by
-# adding it to qwen3_no_thinking). Left empty, pure auto-detection is in effect.
-model_options:
-    deepseek_thinking_always_on: []
-    qwen3_thinking: []
-    qwen3_no_thinking: []
-    no_thinking: []
-
-# ── THINKING: CODING vs PLANNING (coarse toggle) ───────────────────────────────
-# Control whether models think while CODING vs while PLANNING, independent of the
-# per-phase model. Each is true / false / null:
-#   true  -> force thinking ON  where the model family supports it (qwen3 -> /think)
-#   false -> force thinking OFF                                   (qwen3 -> /no_think)
-#   null  -> auto-detect from the model name (the default behavior)
-# Groups: coding   = implementer, reviewer (the coder phases that write code/tests)
-#         planning = requirements, stack_decider, architect, sdd_generator,
-#                    task_planner, planner, escalation (the reasoning phases)
-# Precedence: a specific model_options entry above > this toggle > auto-detect.
-# Shipped ON for both — quality over speed; load/think time is not a concern here.
-thinking:
-    coding: true
-    planning: true
-
-limits:
-    sandbox_timeout: 120 # seconds per command
-    max_fix_retries: 3 # small-model fix attempts per subtask
-    max_escalations: 2 # large-model re-plans per subtask before BLOCK
-    long_process_timeout: 30 # seconds to wait for a background server to become healthy
-    stream_idle_timeout: 600 # seconds of stream silence (no new token) before a call is treated as stalled
+context:
+  max_summary_tokens: 300   # cap per Manager-as-Analyst file summary
+  max_handoff_tokens: 6000  # cap on the assembled Manager handoff context
+  always_include:           # doc summaries always present in every handoff
+    - architecture.md
+    - requirements.md
+  decision_log_max_entries: 20  # rolling window kept in .agent/decisions.md
 
 server:
-    host: "127.0.0.1"
-    port: 8765
+  host: 0.0.0.0
+  port: 8765
+
+# ── HARDWARE / RUNTIME TUNING (16GB VRAM + 32GB RAM box) ─────────────────────────
+# Everything here is editable for a bigger (or smaller) machine.
+ollama:
+  host: "http://localhost:11434"
+  # Ceiling on the per-request context window (num_ctx = KV-cache size, allocated
+  # at model load — the dominant memory cost). The resolver takes
+  # min(model's reported context, this cap). ornith models report 262144, which
+  # would OOM instantly on 16GB VRAM; 32768 is the strong-but-safe value for this
+  # box. Raise it if you upgrade (and set the Ollama server's
+  # OLLAMA_CONTEXT_LENGTH at least this high so it isn't silently capped).
+  max_num_ctx: 32768
+  # keep_alive is DYNAMIC in effect: a model re-called consecutively (the worker
+  # implement/fix loop, back-to-back manager calls) stays warm for this duration,
+  # while a switch to a DIFFERENT model explicitly evicts the old one first (see
+  # evict_on_model_switch). This value is just the warm window between
+  # consecutive same-model calls.
+  keep_alive: "10m"
+  # true (right for <=16GB VRAM): never keep two DIFFERENT models resident — the
+  # 21GB manager and the 5.6GB worker are unloaded/reloaded on switch so they can
+  # never stack and OOM the runner. false: allow stacking (big-VRAM box; with
+  # 24GB+ both ornith models could stay resident and swaps become free).
+  evict_on_model_switch: true
+  # Seconds of stream silence (no new token) before a call is treated as stalled.
+  # Inter-frame, reset per chunk — tolerates long prefill on big context.
+  stream_idle_timeout: 600
+  # End-to-end ceiling litellm applies per request (a slow 35B thinking pass on
+  # this box can legitimately take a long time).
+  request_timeout: 3600
+  # Timeout for the one-off startup thinking probe. Generous on purpose: it must
+  # cover a cold model load into VRAM/RAM (30-60s+ for the 35B).
+  probe_timeout: 120
+
+# Leave blank to use the default AgenticCoder-6/sandbox/<slug>/ (slug derived
+# from the prompt). --project-dir on the CLI overrides this.
+project_dir: ""
+
+# Per-call prompt/response dumps under .agent/llm_calls/{manager,worker}/ (JSONL).
+dump_llm_calls: true

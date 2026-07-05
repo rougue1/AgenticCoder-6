@@ -9,28 +9,47 @@ export type PipelineStatus =
   | 'error'
   | 'cancelled'
 
-// Every event type the backend emits on /events (server/events.py).
+// Every event type the backend emits on /events (server/events.py). Lifecycle
+// events use the dotted redesign taxonomy; the model-stream layer
+// (llm_request/llm_token/llm_thinking_token/llm_complete) and the tool-spec
+// event (file_written) sit outside it and keep their bare names.
 export const EVENT_TYPES = [
-  'stage_start',
-  'stage_end',
+  'pipeline.start',
+  'pipeline.complete',
+  'pipeline.cancelled',
+  'pipeline.paused',
+  'pipeline.resumed',
+  'stage.start',
+  'stage.end',
+  'manager.call_start',
+  'manager.call_end',
+  'manager.handoff_ready',
+  'worker.call_start',
+  'worker.tool_call',
+  'worker.tool_result',
+  'worker.fix_attempt',
+  'summarizer.start',
+  'summarizer.file_complete',
+  'task.start',
+  'task.done',
+  'task.blocked',
+  'task.decomposed',
+  'task.escalated',
+  'test.run',
+  'test.passed',
+  'test.failed',
+  'sandbox.command_rejected',
+  'sandbox.timeout',
+  'preflight.check',
+  'preflight.passed',
+  'preflight.failed',
+  'environment.setup_start',
+  'environment.setup_complete',
   'llm_request',
   'llm_token',
   'llm_thinking_token',
   'llm_complete',
-  'tool_call',
-  'tool_result',
   'file_written',
-  'test_run',
-  'subtask_start',
-  'subtask_done',
-  'subtask_failed',
-  'escalation',
-  'blocked',
-  'compression',
-  'compression_failure',
-  'pipeline_complete',
-  'pipeline_paused',
-  'pipeline_resumed',
   'error',
   'log',
 ] as const
@@ -68,6 +87,7 @@ export interface ProjectState {
   blocked_count: number
   pending_count: number
   in_progress_count: number
+  decomposed_count: number
 }
 
 export interface ThinkingBlock {

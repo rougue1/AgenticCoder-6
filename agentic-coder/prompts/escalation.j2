@@ -1,0 +1,38 @@
+The Worker FAILED this subtask repeatedly; its conversation has been discarded.
+You are re-planning from scratch. Study the failure history — the previous
+approach is broken in some fundamental way, so produce a COMPLETELY NEW
+implementation plan, not a variation of the failed one.
+
+{{ context }}
+
+FULL FAILURE HISTORY (every command, exit code, and output):
+{{ failure_history }}
+
+Diagnose the recurring root cause first (wrong layout? wrong API? missing
+dependency? impossible test?), then write new instructions with EXACTLY these
+sections (no tool calls, no complete file bodies):
+
+## Root Cause of the Failures
+One short paragraph naming the real problem.
+
+## Files to Create or Edit
+Each file: path + a precise description of required contents (signatures, key
+logic, real symbol names). Explicitly call out what must be DIFFERENT from the
+failed approach.
+
+## Step-by-Step Implementation
+Ordered steps. Tests first.
+
+## Tests to Write
+The specific test cases (name + what each asserts).
+
+## Verification
+{% if test_command %}
+The orchestrator will run exactly: `{{ test_command }}` — the work must pass it.
+{% else %}
+State how the result is verified.
+{% endif %}
+
+Then finish with ONE line, the last line of your reply:
+
+DECISION: <one sentence recording what you changed about the approach>

@@ -14,7 +14,7 @@ class Loader:
         self.workspace = workspace
 
     def doc(self, name: str, default: str = "") -> str:
-        """Read an ``.agent/`` document by name (e.g. ``steering.md``)."""
+        """Read an ``.agent/`` document by name (e.g. ``architecture.md``)."""
         return self.workspace.read_agent_doc(name, default) or default
 
     def docs(self, *names: str) -> dict[str, str]:

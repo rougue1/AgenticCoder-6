@@ -1,0 +1,31 @@
+Implement the subtask below by emitting tool calls — EXACTLY ONE per message.
+Follow the Manager's instructions precisely. Write COMPLETE file contents
+(never diffs or placeholders like "... rest unchanged ...").
+
+SUBTASK: {{ subtask_id }} — {{ subtask_title }} (type: {{ subtask_type }})
+
+MANAGER'S INSTRUCTIONS:
+{{ instructions }}
+
+Work in this order:
+1. EXPLORE first if anything is unclear: run `ls -R` (or `find . -type f`) and
+   read_file the files the instructions reference — BEFORE writing. Never guess
+   at code that already exists.
+{% if tdd %}
+2. WRITE THE FAILING TESTS FIRST. Your first written file must be a test file
+   (test_*.py, *_test.py, *.test.ts, *.spec.ts, or under tests/). The
+   orchestrator rejects implementation writes until a test file exists.
+3. Then create every implementation file from "Files to Create or Edit":
+   write_file for new files, patch_file for surgical changes to existing ones.
+{% else %}
+2. Create every file from "Files to Create or Edit": write_file for new files,
+   patch_file for surgical changes to existing ones.
+{% endif %}
+4. If the work needs third-party packages, actually INSTALL them with run
+   (e.g. run `pip install -r requirements.txt`) — writing the manifest file
+   alone installs nothing.
+5. When all files (and tests) are written, reply with the single line: DONE
+
+Do NOT run the final test suite yourself — the orchestrator runs the
+verification command after you say DONE. (Running a quick targeted check while
+working is fine.)

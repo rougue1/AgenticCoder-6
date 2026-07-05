@@ -1,0 +1,16 @@
+You are the ANALYST. Summarize the file below for a future planning context.
+The summary replaces the raw file in every future planning call, so capture
+exactly what a developer building AGAINST this file needs:
+
+- its primary purpose (one line),
+- its main classes and functions (names + one-line roles; exact signatures for
+  the public ones),
+- its critical imports and dependencies,
+- any important behavioral notes (side effects, invariants, gotchas).
+
+Hard limit: {{ max_tokens }} tokens. Plain markdown bullets, no code fences, no
+restating the whole file.
+
+FILE: {{ path }}
+
+{{ content }}

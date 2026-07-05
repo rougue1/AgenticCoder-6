@@ -1,46 +1,56 @@
-"""The subtask loop (spec §9) — implement -> test -> fix -> escalate -> block.
+"""Phase 2 — the subtask execution loop (redesign).
 
-This is the heart of the pipeline. For each pending subtask whose dependencies
-are done it: plans (large model), opens an ephemeral conversation to implement +
-write tests (small model), runs the tests (orchestrator executes — the model only
-*requests* the command), and on failure walks the bounded ladder:
+For each runnable subtask (all dependencies done):
 
-    fix (same convo, small model)  x max_fix_retries
-      -> escalate (fresh plan from large model + full failure history)  x max_escalations
-        -> block (record to blocked.md, skip dependents)
+STEP A  Manager handoff — anchor + subtask + doc summaries + decisions +
+        dependency file summaries + manifest tree -> precise Worker
+        instructions + a one-line decision note (``stages/manager.handoff``).
+STEP B  Worker TDD loop — a stateful conversation (``stages/worker``) writes
+        tests-first, then implementation; the ORCHESTRATOR runs the subtask's
+        test command after each turn and walks the bounded ladder on failure:
 
-Caps come from ``config.limits``; the loop can never run unbounded.
+            fix (same conversation)            x max_fix_retries
+              -> escalate (new Manager plan,
+                 fresh conversation)           x max_escalations
+                -> decompose (2-4 micro-
+                   subtasks, injected once)    x max_decompositions
+                  -> hard block (+ cascade to dependents)
+
+STEP C  Post-task summarization — every file the subtask touched gets a
+        Manager-as-Analyst summary; install subtasks get a silent dependency
+        conflict check; every test run lands in ``test_results.jsonl``
+        (retries ``is_final=false``, the terminal run ``is_final=true``).
 """
 
 from __future__ import annotations
 
-import re
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from orchestrator.states import SubtaskState
+from orchestrator.states import SubtaskOutcome
 from server import events
 from services import Services
-from stages import planner
-from stages.implementer import Implementer
-from taskstore import BLOCKED, DONE, IN_PROGRESS, TaskStore
-from tools.sandbox import normalize_pytest_command
+from stages import manager, summarizer
+from stages.worker import WorkerSession
+from taskstore import BLOCKED, DECOMPOSED, DONE, IN_PROGRESS, TaskStore
 
-
+# Dependency manifests we know how to install from when an install-type subtask
+# ships no test command. Doubles as the environment-population step.
 def _npm_install(path: str) -> str:
-    """npm install for a package.json; --prefix targets a manifest in a subdir."""
     d = path.rsplit("/", 1)[0] if "/" in path else ""
     return f"npm --prefix {d} install" if d else "npm install"
 
 
-# Dependency manifests we know how to install from when a subtask ships no test
-# command. The sandbox classifies these as install steps and lets them reach the
-# network. Order matters only for which is tried first.
 _MANIFEST_INSTALL = [
     ("requirements.txt", lambda p: f"pip install -r {p}"),
     ("requirements-dev.txt", lambda p: f"pip install -r {p}"),
     ("package.json", _npm_install),
 ]
+
+# Subtask types under TDD enforcement (pytest exit 5 = "no tests collected" is a
+# FAILURE for these — a green empty suite would silently defeat tests-first).
+_TDD_TYPES = ("implement", "integrate")
 
 
 @dataclass
@@ -61,22 +71,31 @@ class FailureRecord:
 
 
 @dataclass
+class VerifyResult:
+    cmd: str
+    passed: bool
+    stdout: str
+    stderr: str
+    exit_code: int
+    duration: float = 0.0
+
+
+@dataclass
 class LoopResult:
     done: int = 0
     blocked: int = 0
+    decomposed: int = 0
     blocked_ids: list[str] = field(default_factory=list)
 
 
 class SubtaskLoop:
     def __init__(self, services: Services):
         self.services = services
-        self.cfg = services.config.limits
+        self.cfg = services.config.pipeline
         self.bus = services.bus
-        self.stack_doc = ""
 
     def run(self) -> LoopResult:
         """Process every runnable subtask until none remain."""
-        self.stack_doc = self.services.loader.doc("stack.md")
         result = LoopResult()
         while True:
             self.services.check_cancel()
@@ -86,169 +105,191 @@ class SubtaskLoop:
                 break
             task, sub = picked
             outcome = self._process_subtask(store, task, sub)
-            if outcome == SubtaskState.DONE:
+            if outcome == SubtaskOutcome.DONE:
                 result.done += 1
-            elif outcome == SubtaskState.BLOCK:
+            elif outcome == SubtaskOutcome.DECOMPOSED:
+                result.decomposed += 1
+            elif outcome == SubtaskOutcome.BLOCKED:
                 result.blocked += 1
                 result.blocked_ids.append(sub["id"])
         self.services.progress.clear()
         return result
 
     # ── one subtask through the ladder ────────────────────────────────────────
-    def _process_subtask(self, store: TaskStore, task: dict, sub: dict) -> SubtaskState:
+    def _process_subtask(self, store: TaskStore, task: dict, sub: dict) -> SubtaskOutcome:
         sid = sub["id"]
         store.set_status(sid, IN_PROGRESS)
         self.services.progress.begin_subtask(sub)
-        self.bus.emit(events.SUBTASK_START, "subtask_loop", id=sid, title=sub.get("title", ""))
+        self.bus.emit(events.TASK_START, "subtask_loop", id=sid, title=sub.get("title", ""), type=sub.get("type", ""))
 
         failures: list[FailureRecord] = []
         escalations_left = self.cfg.max_escalations
+        attempt = 0
 
-        # initial plan (PLAN state)
-        self.services.progress.activity = "plan"
-        plan = planner.run(self.services, task, sub)
+        # STEP A — Manager handoff.
+        self.services.progress.activity = "handoff"
+        instructions = manager.handoff(self.services, sub, store)
 
-        while True:  # escalation loop
+        while True:  # escalation loop (each iteration = a fresh Worker conversation)
             self.services.check_cancel()
             self.services.progress.activity = "implement"
-            impl = Implementer(self.services, task, sub, plan)  # fresh ephemeral conversation
-            impl.implement_and_write_tests()  # IMPLEMENT + WRITE_TESTS
+            session = WorkerSession(self.services, sub, instructions)
+            session.attempt = attempt + 1
+            session.implement()
 
             fix_left = self.cfg.max_fix_retries
-            attempt = 0
-            while True:  # implement/fix -> run loop
+            while True:  # test / fix loop (one Worker conversation)
                 self.services.check_cancel()
                 attempt += 1
+                session.attempt = attempt
                 self.services.progress.activity = "test"
-                cmd, passed, out, err, code = self._run_tests(plan, sub)
+                verify = self._verify(sub)
+
+                escalation_round = self.cfg.max_escalations - escalations_left
+                # Final = passed, or the last rung of the ladder (decomposition/
+                # block both end THIS subtask's test history).
+                is_final = verify.passed or (fix_left <= 0 and escalations_left <= 0)
+                self._log_test_result(sid, verify, attempt, is_final=is_final, escalation=escalation_round)
                 self.bus.test_run(
                     "subtask_loop",
-                    cmd or "(no test command)",
-                    code,
-                    passed,
-                    output=_tail(((err or "") + ("\n" + out if out else "")).strip(), 1500),
+                    verify.cmd or "(no test command)",
+                    verify.exit_code,
+                    verify.passed,
+                    output=_tail(((verify.stderr or "") + ("\n" + verify.stdout if verify.stdout else "")).strip(), 1500),
                 )
 
-                if passed:
-                    self._mark_done(store, sid)
-                    return SubtaskState.DONE
+                if verify.passed:
+                    self._finish_done(store, sub, session)
+                    return SubtaskOutcome.DONE
 
                 failures.append(
                     FailureRecord(
                         attempt=len(failures) + 1,
-                        cmd=cmd or "(no test command found)",
-                        exit_code=code,
-                        stdout=out,
-                        stderr=err,
-                        note="" if cmd else "Plan did not specify a runnable test command.",
+                        cmd=verify.cmd or "(no test command found)",
+                        exit_code=verify.exit_code,
+                        stdout=verify.stdout,
+                        stderr=verify.stderr,
+                        note="" if verify.cmd else "Subtask declared no runnable test command.",
                     )
                 )
-                self.bus.emit(events.SUBTASK_FAILED, "subtask_loop", id=sid, attempt=attempt, exit_code=code)
 
                 if fix_left > 0:
                     fix_left -= 1
+                    fix_no = self.cfg.max_fix_retries - fix_left
+                    self.bus.emit(
+                        events.WORKER_FIX_ATTEMPT,
+                        "subtask_loop",
+                        id=sid,
+                        attempt=fix_no,
+                        exit_code=verify.exit_code,
+                    )
                     self.services.progress.activity = "fix"
-                    impl.fix(  # FIX (same conversation)
-                        cmd=cmd or "(no test command)",
-                        exit_code=code,
-                        stdout=out,
-                        stderr=err,
-                        attempt=self.cfg.max_fix_retries - fix_left,
+                    session.fix(
+                        cmd=verify.cmd or "(no test command)",
+                        exit_code=verify.exit_code,
+                        stdout=verify.stdout,
+                        stderr=verify.stderr,
+                        attempt=fix_no,
                         max_attempts=self.cfg.max_fix_retries,
                     )
                     continue
-                break  # fixes exhausted -> escalate or block
+                break  # fixes exhausted -> escalate / decompose / block
 
-            if escalations_left > 0:  # ESCALATE
+            history = "\n\n".join(f.render() for f in failures)
+
+            if escalations_left > 0:  # ESCALATE — discard the conversation, re-plan
                 escalations_left -= 1
                 self.services.progress.activity = "escalate"
                 self.bus.emit(
-                    events.ESCALATION,
+                    events.TASK_ESCALATED,
                     "subtask_loop",
                     id=sid,
                     escalations_left=escalations_left,
                     failures=len(failures),
                 )
-                plan = planner.run(
-                    self.services,
-                    task,
-                    sub,
-                    failure_history="\n\n".join(f.render() for f in failures),
-                    phase="escalation",
+                instructions = manager.escalate(self.services, sub, history, store)
+                continue
+
+            # DECOMPOSE — once, if this subtask still may.
+            decomposition_errors: list[str] | None = None
+            if sub.get("can_decompose", True) and not sub.get("is_decomposed", False) and self.cfg.max_decompositions > 0:
+                self.services.progress.activity = "decompose"
+                micro = manager.decompose(self.services, sub, history, store)
+                if micro:
+                    decomposition_errors = store.inject_decomposed(sid, micro)
+                else:
+                    decomposition_errors = ["the Manager produced no parseable micro-subtasks"]
+                self._record_decomposition(sub, history, micro, decomposition_errors)
+                if not decomposition_errors:
+                    self.bus.emit(events.TASK_DECOMPOSED, "subtask_loop", id=sid, micro_count=len(micro))
+                    summarizer_count = self._summarize_session(sub, session)
+                    self.bus.log(
+                        f"{sid} decomposed into {len(micro)} micro-subtask(s); "
+                        f"{summarizer_count} file summar(ies) refreshed",
+                        phase="subtask_loop",
+                    )
+                    return SubtaskOutcome.DECOMPOSED
+                self.bus.log(
+                    f"decomposition of {sid} failed validation: {'; '.join(decomposition_errors[:5])}",
+                    phase="subtask_loop",
+                    level="warn",
                 )
-                continue  # discard old convo, re-enter IMPLEMENT with the new plan
 
-            self._mark_blocked(store, task, sub, failures)  # BLOCK
-            return SubtaskState.BLOCK
+            self._finish_blocked(store, task, sub, failures, session)  # HARD BLOCK
+            return SubtaskOutcome.BLOCKED
 
-    # ── RUN ───────────────────────────────────────────────────────────────────
-    def _run_tests(self, plan: str, sub: dict):
-        cmd = extract_test_command(plan, sub, self.stack_doc)
-        if not cmd:
-            # The planner gave no runnable test command (common for scaffold/manifest
-            # subtasks like "create requirements.txt"). Don't report a guaranteed
-            # failure every attempt and burn the whole fix/escalate ladder for
-            # nothing — verify what is actually checkable instead.
-            return self._fallback_verification(sub)
-        cmd = normalize_pytest_command(cmd)
-        result = self.services.sandbox.run(cmd)
-        passed = result.ok
-        # pytest exit 5 = "no tests collected". For scaffold/setup subtasks the
-        # spec's own criterion is "the test runner executes an empty suite
-        # successfully", so a working runner that finds nothing is a pass.
-        if not passed and result.exit_code == 5 and "pytest" in cmd:
-            passed = True
-            self.bus.log("pytest collected no tests (exit 5) — empty suite treated as pass", phase="subtask_loop")
-        return cmd, passed, result.stdout, result.stderr, result.exit_code
+    # ── verification (the orchestrator runs tests — never the model) ──────────
+    def _verify(self, sub: dict) -> VerifyResult:
+        cmd = str(sub.get("test_command") or "").strip()
+        stype = str(sub.get("type") or "").lower()
+        if cmd:
+            res = self.services.sandbox.run(cmd)
+            passed = res.ok
+            # pytest exit 5 = "no tests collected": acceptable for scaffold-ish
+            # types, a FAILURE for TDD-enforced types (an empty suite must not
+            # green an implementation subtask).
+            if not passed and res.exit_code == 5 and "pytest" in cmd and stype not in _TDD_TYPES:
+                passed = True
+                self.bus.log("pytest collected no tests (exit 5) — empty suite passes for this subtask type", phase="subtask_loop")
+            return VerifyResult(cmd, passed, res.stdout, res.stderr, res.exit_code, res.duration)
+        return self._fallback_verification(sub)
 
-    # ── fallback verification (no planner-provided test command) ──────────────
-    def _fallback_verification(self, sub: dict):
-        """Verify a subtask that declared no runnable test command.
+    def _fallback_verification(self, sub: dict) -> VerifyResult:
+        """Verify a subtask that declared no test command (scaffold/config/install).
 
-        Every subtask is supposed to ship a concrete test command, but local models
-        sometimes omit one (typically for scaffold/manifest subtasks). Rather than
-        report a guaranteed failure each attempt — which pointlessly walks the whole
-        fix -> escalate -> block ladder — verify what is actually checkable:
-
-        1. If the subtask produced a dependency manifest, prove the dependencies
-           INSTALL. This also performs the install the scaffold needs so later
-           subtasks' imports resolve, and surfaces a broken/hallucinated manifest as
-           a real, fixable error instead of a silent skip.
-        2. Otherwise accept iff every file the subtask declared now exists and is
-           non-empty; if not, report a clear failure.
+        1. install-type with a dependency manifest -> prove the dependencies
+           INSTALL (this also populates the environment for later subtasks).
+        2. otherwise accept iff every declared file exists non-empty.
         """
         install = self._manifest_install_command(sub)
-        if install:
+        if install and str(sub.get("type") or "").lower() == "install":
             res = self.services.sandbox.run(install)
             if res.ok:
                 self.bus.log(f"no test command; verified dependencies install via `{install}`", phase="subtask_loop")
-            return install, res.ok, res.stdout, res.stderr, res.exit_code
+            return VerifyResult(install, res.ok, res.stdout, res.stderr, res.exit_code, res.duration)
 
         files = [str(f).strip() for f in (sub.get("files") or []) if str(f).strip()]
         missing = [f for f in files if not self._file_present(f)]
         if files and not missing:
             self.bus.log(f"no test command; accepted on file presence ({len(files)} file(s))", phase="subtask_loop")
-            return "(no test command; declared files present)", True, "", "", 0
+            return VerifyResult("(declared files present)", True, "", "", 0)
         msg = (
             "No runnable test command for this subtask and it produced no verifiable "
             f"output. Missing or empty files: {', '.join(missing) or '(none declared)'}."
         )
-        return None, False, "", msg, 1
+        return VerifyResult("", False, "", msg, 1)
 
     def _manifest_install_command(self, sub: dict) -> str | None:
-        """Install command for a dependency manifest this subtask created, if any."""
         declared = [str(f).strip().replace("\\", "/") for f in (sub.get("files") or [])]
         for name, make_cmd in _MANIFEST_INSTALL:
             for d in declared:
                 if (d == name or d.endswith("/" + name)) and self._file_present(d):
                     return make_cmd(d)
-        # Catch a root requirements.txt even if this subtask didn't declare it.
         if self._file_present("requirements.txt"):
             return "pip install -r requirements.txt"
         return None
 
     def _file_present(self, rel: str) -> bool:
-        """True if *rel* resolves inside the project root and is a non-empty file."""
         try:
             p = self.services.workspace.resolve_in_root(rel)
         except Exception:
@@ -258,84 +299,87 @@ class SubtaskLoop:
         except OSError:
             return False
 
-    # ── state updates ─────────────────────────────────────────────────────────
-    def _mark_done(self, store: TaskStore, sid: str) -> None:
-        store.set_status(sid, DONE)
-        self.services.manifest.regenerate()
-        self.bus.emit(events.SUBTASK_DONE, "subtask_loop", id=sid)
+    # ── test_results.jsonl ─────────────────────────────────────────────────────
+    def _log_test_result(self, sid: str, verify: VerifyResult, attempt: int, *, is_final: bool, escalation: int) -> None:
+        record = {
+            "subtask_id": sid,
+            "cmd": verify.cmd,
+            "exit_code": verify.exit_code,
+            "duration": round(verify.duration, 3),
+            "attempt": attempt,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "is_final": is_final,
+            "passed": verify.passed,
+            "escalation": escalation,
+        }
+        self.services.workspace.append_agent_doc("test_results.jsonl", json.dumps(record) + "\n")
 
-    def _mark_blocked(self, store: TaskStore, task: dict, sub: dict, failures: list[FailureRecord]) -> None:
+    # ── outcomes ──────────────────────────────────────────────────────────────
+    def _finish_done(self, store: TaskStore, sub: dict, session: WorkerSession) -> None:
+        sid = sub["id"]
+        store.set_status(sid, DONE)
+        n = self._summarize_session(sub, session)
+        if str(sub.get("type") or "").lower() == "install":
+            summarizer.post_install_check(self.services)
+        self.bus.emit(events.TASK_DONE, "subtask_loop", id=sid, files_summarized=n)
+
+    def _finish_blocked(
+        self,
+        store: TaskStore,
+        task: dict,
+        sub: dict,
+        failures: list[FailureRecord],
+        session: WorkerSession,
+    ) -> None:
         sid = sub["id"]
         store.set_status(sid, BLOCKED)
+        cascaded = store.cascade_block(sid)
         last = failures[-1] if failures else None
-        summary = (
-            f"## {sid} — {sub.get('title','')}\n"
-            f"- Parent task: {task.get('id')} {task.get('title','')}\n"
-            f"- Intent: {sub.get('intent','')}\n"
+        record = (
+            f"## {sid} — {sub.get('title', '')}\n"
+            f"- Parent task: {task.get('id')} {task.get('title', '')}\n"
+            f"- Type: {sub.get('type', '')}\n"
+            f"- Intent: {sub.get('intent', '')}\n"
             f"- Attempts: {len(failures)} (fixes + escalations exhausted)\n"
             f"- Last command: `{last.cmd if last else 'n/a'}` (exit {last.exit_code if last else 'n/a'})\n"
             f"- Last error:\n```\n{_tail(last.stderr if last else '', 1500)}\n```\n"
+            f"- Dependents blocked with it: {', '.join(cascaded) or '(none)'}\n"
             f"- Recorded: {datetime.now(timezone.utc).isoformat()}\n"
         )
         existing = self.services.workspace.read_agent_doc("blocked.md") or "# Blocked Subtasks\n\n"
-        self.services.workspace.write_agent_doc("blocked.md", existing.rstrip() + "\n\n" + summary)
-        self.bus.emit(events.BLOCKED, "subtask_loop", id=sid, attempts=len(failures))
+        self.services.workspace.write_agent_doc("blocked.md", existing.rstrip() + "\n\n" + record)
+        self._summarize_session(sub, session)
+        self.bus.emit(events.TASK_BLOCKED, "subtask_loop", id=sid, attempts=len(failures), cascaded=cascaded)
 
+    def _summarize_session(self, sub: dict, session: WorkerSession) -> int:
+        """STEP C — Analyst summaries for every file this subtask touched."""
+        self.services.progress.activity = "summarize"
+        try:
+            return summarizer.summarize_files(self.services, sub["id"], sorted(session.files_touched))
+        except Exception as exc:  # a summary failure must not fail the subtask
+            self.bus.log(f"post-task summarization failed: {exc}", phase="summarizer", level="warn")
+            return 0
 
-# ── test-command extraction ────────────────────────────────────────────────────
-_RUNNER_RE = re.compile(
-    r"^\s*(?:\$\s*)?((?:npm|npx|pnpm|yarn|bun|bunx|pytest|python\d?|py|node|deno|go|cargo|"
-    r"mvn|gradle|dotnet|ruby|rspec|bundle|make|jest|vitest|mocha|phpunit|composer|"
-    r"./gradlew|sh|bash)\b.*)$",
-    re.I | re.M,
-)
-_HEADING_RE = re.compile(
-    r"(?:Exact Command to Run Tests|Command to Run Tests|Run Tests|Test Command)\s*:?",
-    re.I,
-)
-
-
-def extract_test_command(plan: str, sub: dict, stack_doc: str) -> str | None:
-    """Find the command to verify the subtask (plan -> test_strategy -> stack)."""
-    for source in (_plan_command_region(plan), plan, sub.get("test_strategy", "")):
-        cmd = _first_command(source)
-        if cmd:
-            return cmd.strip()
-    return _stack_test_command(stack_doc) or _first_command(stack_doc)
-
-
-def _stack_test_command(stack_doc: str) -> str | None:
-    """Prefer the explicitly-labeled ``test:`` command from stack.md."""
-    m = re.search(r"^\s*[-*]?\s*test\s*:\s*`([^`]+)`", stack_doc or "", re.I | re.M)
-    return m.group(1).strip() if m else None
-
-
-def _plan_command_region(plan: str) -> str:
-    m = _HEADING_RE.search(plan or "")
-    if not m:
-        return ""
-    return plan[m.end() : m.end() + 600]
-
-
-def _first_command(text: str) -> str | None:
-    if not text:
-        return None
-    # 1) fenced code block
-    fence = re.search(r"```(?:bash|sh|shell|console)?\s*\n(.+?)```", text, re.S)
-    if fence:
-        for line in fence.group(1).splitlines():
-            line = line.strip().lstrip("$ ").strip()
-            if line and not line.startswith("#"):
-                return line
-    # 2) inline backticked command
-    for inline in re.findall(r"`([^`]+)`", text):
-        if _RUNNER_RE.match(inline.strip()):
-            return inline.strip()
-    # 3) a bare line that begins with a known runner
-    m = _RUNNER_RE.search(text)
-    if m:
-        return m.group(1).strip()
-    return None
+    # ── decomposition record ──────────────────────────────────────────────────
+    def _record_decomposition(
+        self, sub: dict, history: str, micro: list[dict], errors: list[str] | None
+    ) -> None:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        sid = str(sub.get("id", "unknown"))
+        body = (
+            f"# Decomposition — {sid}\n\n"
+            f"- When: {datetime.now(timezone.utc).isoformat()}\n"
+            f"- Outcome: {'INJECTED' if not errors else 'REJECTED: ' + '; '.join(errors)}\n\n"
+            f"## Original subtask\n\n```json\n{json.dumps(sub, indent=2)}\n```\n\n"
+            f"## Proposed micro-subtasks\n\n```json\n{json.dumps(micro, indent=2)}\n```\n\n"
+            f"## Failure history that triggered it\n\n{history}\n"
+        )
+        path = self.services.workspace.decompositions_dir / f"{ts}_{sid}.md"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+        except OSError as exc:
+            self.bus.log(f"could not write decomposition record: {exc}", phase="subtask_loop", level="warn")
 
 
 def _tail(text: str, limit: int = 4000) -> str:

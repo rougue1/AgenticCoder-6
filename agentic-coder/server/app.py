@@ -9,7 +9,7 @@ Control / data endpoints:
 * ``POST /cancel``           — cooperatively cancel the current run.
 * ``GET  /status``           — legacy state snapshot.
 * ``GET  /project/state``    — rich snapshot for the IDE frontend.
-* ``GET  /project/manifest`` — current ``file_manifest.md`` (plain text).
+* ``GET  /project/manifest`` — the annotated Worker-file manifest (plain text).
 * ``GET  /file?path=``       — content of a file inside the project root.
 * ``GET  /healthz``          — liveness probe (used by main.py to wait for boot).
 
@@ -30,8 +30,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from config import AppConfig
+from context.manifest import Manifest
 from orchestrator.orchestrator import Orchestrator
-from server.events import TERMINAL_TYPES, Event, EventBus
+from server.events import Event, EventBus
 from workspace import PathEscapeError
 
 _KEEPALIVE_SECONDS = 15
@@ -125,8 +126,12 @@ def create_app(config: AppConfig) -> FastAPI:
     async def project_manifest() -> PlainTextResponse:
         orch: Orchestrator = app.state.orchestrator
         ws = orch.active_workspace()
-        text = ws.read_agent_doc("file_manifest.md", "") if ws else ""
-        return PlainTextResponse(text or "")
+        if ws is None:
+            return PlainTextResponse("")
+        # Prefer the live manifest (in-memory + sidecar); fall back to a fresh
+        # load for a not-yet-attached on-disk project.
+        manifest = orch.services.manifest if orch.services.manifest is not None else Manifest(ws)
+        return PlainTextResponse(manifest.render_markdown())
 
     @app.get("/file")
     async def get_file(path: str = Query(..., description="project-relative file path")) -> JSONResponse:

@@ -43,6 +43,7 @@ const EMPTY_STATE: ProjectState = {
   blocked_count: 0,
   pending_count: 0,
   in_progress_count: 0,
+  decomposed_count: 0,
 }
 
 export interface PipelineStore {
@@ -218,7 +219,7 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
 
     // 2) typed reducers
     switch (ev.type) {
-      case 'stage_start':
+      case 'stage.start':
         set((p) => ({
           startedAtMs: p.startedAtMs ?? Date.now(),
           state: { ...p.state, phase, activity: '' },
@@ -272,7 +273,7 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
         break
       }
 
-      case 'tool_call': {
+      case 'worker.tool_call': {
         const row: ToolCallRow = {
           id: nextId(),
           ts,
@@ -285,7 +286,7 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
             p.toolCalls.length >= TOOLCALL_CAP ? p.toolCalls.slice(1) : p.toolCalls.slice()
           toolCalls.push(row)
           const writingPath =
-            (row.tool === 'write_file' || row.tool === 'edit_file') && row.args?.path
+            (row.tool === 'write_file' || row.tool === 'patch_file') && row.args?.path
               ? String(row.args.path)
               : p.writingPath
           return { toolCalls, writingPath }
@@ -293,7 +294,7 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
         break
       }
 
-      case 'tool_result':
+      case 'worker.tool_result':
         set((p) => {
           const toolCalls = p.toolCalls.slice()
           // attach to the most recent call of the same tool still awaiting a result
@@ -327,7 +328,7 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
         break
       }
 
-      case 'test_run': {
+      case 'test.run': {
         const passed = !!data.passed
         const row: TestResultRow = {
           id: nextId(),
@@ -352,19 +353,19 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
         break
       }
 
-      case 'subtask_start':
+      case 'task.start':
         set({ subtaskStartedAtMs: Date.now() })
         break
 
-      case 'pipeline_paused':
+      case 'pipeline.paused':
         set((p) => ({ status: 'paused', state: { ...p.state, paused: true } }))
         break
 
-      case 'pipeline_resumed':
+      case 'pipeline.resumed':
         set((p) => ({ status: 'running', state: { ...p.state, paused: false } }))
         break
 
-      case 'pipeline_complete': {
+      case 'pipeline.complete': {
         const result = String(data.result || 'done')
         const status: PipelineStatus =
           result === 'cancelled'
@@ -377,6 +378,11 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
         set((p) => ({ status, writingPath: null, state: { ...p.state, running: false } }))
         break
       }
+
+      // A cancelled run fires pipeline.cancelled instead of pipeline.complete.
+      case 'pipeline.cancelled':
+        set((p) => ({ status: 'cancelled', writingPath: null, state: { ...p.state, running: false } }))
+        break
 
       default:
         break
@@ -439,9 +445,9 @@ function bumpTps(set: SetFn, get: GetFn, token: string) {
 function describe(ev: SSEEvent): string {
   const d = ev.data || {}
   switch (ev.type) {
-    case 'stage_start':
+    case 'stage.start':
       return `stage: ${ev.phase} — ${d.title || ''}`
-    case 'stage_end':
+    case 'stage.end':
       return `stage complete: ${ev.phase}`
     case 'llm_request':
       return `calling ${d.model} (~${d.prompt_token_estimate ?? '?'} tok)`
@@ -449,29 +455,35 @@ function describe(ev: SSEEvent): string {
       return `model done (${d.total_tokens ?? '?'} tok, ${d.duration ?? '?'}s${
         d.tokens_per_second ? `, ${d.tokens_per_second} tok/s` : ''
       })`
-    case 'tool_call':
+    case 'worker.tool_call':
       return `${d.tool} ${d.args?.cmd ? '`' + d.args.cmd + '`' : d.args?.path || ''}`
-    case 'tool_result':
+    case 'worker.tool_result':
       return `${d.tool} ${'exit_code' in d ? 'exit=' + d.exit_code : d.ok ? 'ok' : 'error'}`
     case 'file_written':
       return `${d.action || 'write'} ${d.path}`
-    case 'test_run':
+    case 'test.run':
       return `tests ${d.passed ? 'PASS' : 'FAIL'} — ${d.cmd || ''}`
-    case 'subtask_start':
+    case 'task.start':
       return `subtask ${d.id} — ${d.title || ''}`
-    case 'subtask_done':
+    case 'task.done':
       return `subtask ${d.id} done`
-    case 'subtask_failed':
+    case 'worker.fix_attempt':
       return `subtask ${d.id} attempt ${d.attempt} failed (exit ${d.exit_code})`
-    case 'escalation':
+    case 'task.escalated':
       return `escalating ${d.id} (${d.escalations_left} left)`
-    case 'blocked':
+    case 'task.decomposed':
+      return `${d.id} decomposed into ${d.micro_count ?? '?'} micro-subtask(s)`
+    case 'task.blocked':
       return `blocked ${d.id} after ${d.attempts} attempts`
-    case 'pipeline_complete':
+    case 'manager.handoff_ready':
+      return `handoff ready for ${d.subtask_id} — ${d.decision || ''}`
+    case 'pipeline.complete':
       return `pipeline ${d.result}`
-    case 'pipeline_paused':
+    case 'pipeline.cancelled':
+      return 'pipeline cancelled'
+    case 'pipeline.paused':
       return 'pipeline paused'
-    case 'pipeline_resumed':
+    case 'pipeline.resumed':
       return 'pipeline resumed'
     case 'error':
       return `error: ${d.message || ''}`

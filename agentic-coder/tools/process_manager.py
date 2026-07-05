@@ -62,12 +62,13 @@ class ProcessManager:
     def start(self, cmd: str, *, allow_network: bool | None = None) -> ProcessHandle:
         if allow_network is None:
             allow_network = self.sandbox.is_install_command(cmd)
-        env = self.sandbox._build_env(allow_network)
+        env = self.sandbox.build_env(allow_network)
+        exec_cmd = self.sandbox.rewrite_command(cmd)  # venv transparency, same as foreground
         log_fh = tempfile.NamedTemporaryFile(
             mode="w+", suffix=".log", prefix="aiforge-proc-", delete=False, encoding="utf-8"
         )
         proc = subprocess.Popen(
-            cmd,
+            exec_cmd,
             shell=True,
             cwd=str(self.workspace.root),
             stdout=log_fh,

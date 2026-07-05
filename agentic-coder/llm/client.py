@@ -1,34 +1,40 @@
-"""LiteLLM streaming wrapper with per-phase model selection (spec §14).
+"""Tier-based LiteLLM streaming client for Ollama (redesign).
 
-Responsibilities:
+Two named tiers — ``manager`` and ``worker`` — each backed by a
+:class:`llm.resolution.RuntimeModelConfig` resolved once at startup. Every call
+site passes the tier plus a human ``phase`` label; the client:
 
-* pick the model + thinking mode for a phase (from :class:`config.AppConfig`);
-* apply the qwen3 ``/think`` / ``/no_think`` suffix where required;
-* stream tokens to the EventBus, splitting ``<think>...</think>`` reasoning into
-  ``llm_thinking_token`` events and everything else into ``llm_token`` events
-  (tags may be split across stream chunks — handled by :class:`ThinkSplitter`);
-* emit ``llm_request`` / ``llm_complete`` and optionally dump prompt+response to
-  ``.agent/llm_calls/`` for debugging.
+* picks the tier's model, temperature, and effective ``num_ctx``;
+* drives thinking via Ollama's native ``think`` parameter (only when the model
+  advertises the capability and the tier's resolved ``thinking_enabled`` is on);
+* streams tokens to the EventBus, splitting reasoning (``reasoning_content``
+  deltas AND inline ``<think>`` tags) from output;
+* enforces the **one-model-resident** memory policy: keep_alive keeps the same
+  model warm across consecutive calls (the worker's tool loop), while a switch
+  to a different model unloads the old one first so two models never stack in
+  16GB VRAM (``evict_on_model_switch``);
+* emits ``manager.call_start``/``manager.call_end`` lifecycle events for
+  manager-tier calls on top of the raw ``llm_request``/``llm_complete`` stream
+  events both tiers get;
+* dumps each call as one JSONL record under ``.agent/llm_calls/<tier>/``
+  (manager: one file per call; worker: appended to a per-subtask session file).
 """
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
 
-from config import (
-    THINK_DEEPSEEK,
-    THINK_NONE,
-    THINK_QWEN3_OFF,
-    THINK_QWEN3_ON,
-    AppConfig,
-)
+from config import MANAGER, AppConfig
+from llm.resolution import RuntimeModelConfig
 from tokens import estimate_messages_tokens, estimate_tokens
 
 if TYPE_CHECKING:
@@ -37,19 +43,20 @@ if TYPE_CHECKING:
 
 
 class LLMError(RuntimeError):
-    """Raised when an LLM call fails (network, model missing, etc.)."""
+    """Raised when an LLM call fails (network, model missing, stalled stream…)."""
 
 
 @dataclass
 class CompletionResult:
     text: str = ""        # the model's final answer (thinking stripped out)
-    thinking: str = ""    # accumulated <think> content
+    thinking: str = ""    # accumulated reasoning content
     raw: str = ""         # everything, in order, as produced
     model: str = ""
+    tier: str = ""
     phase: str = ""
     total_tokens: int = 0
     duration: float = 0.0      # whole call (model load + prefill + generation)
-    gen_duration: float = 0.0  # first token -> last token (generation only; for tok/s)
+    gen_duration: float = 0.0  # first token -> last token (for tok/s)
 
     def __bool__(self) -> bool:
         return bool(self.text.strip() or self.raw.strip())
@@ -59,7 +66,8 @@ class ThinkSplitter:
     """Incrementally split a token stream into (output, thinking) segments.
 
     Handles ``<think>``/``</think>`` tags that arrive split across chunks by
-    holding back a small tail that could be the start of a tag.
+    holding back a small tail that could be the start of a tag. Path B for
+    models whose template inlines thinking instead of using the native field.
     """
 
     OPEN = "<think>"
@@ -83,7 +91,7 @@ class ThinkSplitter:
                     break
                 if idx > 0:
                     out.append(("output", self.buf[:idx]))
-                self.buf = self.buf[idx + len(self.OPEN) :]
+                self.buf = self.buf[idx + len(self.OPEN):]
                 self.in_think = True
             else:
                 idx = self.buf.find(self.CLOSE)
@@ -94,7 +102,7 @@ class ThinkSplitter:
                     break
                 if idx > 0:
                     out.append(("think", self.buf[:idx]))
-                self.buf = self.buf[idx + len(self.CLOSE) :]
+                self.buf = self.buf[idx + len(self.CLOSE):]
                 self.in_think = False
         return out
 
@@ -122,25 +130,37 @@ class LLMClient:
         self.config = config
         self.bus = bus
         self.workspace = workspace
-        # The model Ollama is currently holding warm (the last one we issued a call
-        # to). Used to enforce "at most one model resident at a time" by unloading it
-        # before a DIFFERENT model loads — the fix for the 27B->30B swap OOM/EOF.
+        # Set once by the orchestrator after llm.resolution.resolve_all(). All
+        # model parameters are read from here — never from raw config fields.
+        self.runtime: dict[str, RuntimeModelConfig] = {}
+        # The model Ollama currently holds warm (the last one we called). Used to
+        # enforce "at most one model resident at a time": a DIFFERENT model is
+        # unloaded before the next loads, a re-called model stays warm.
         self._resident_model: str | None = None
         self._mem_lock = threading.Lock()
 
     def set_workspace(self, workspace: "Workspace") -> None:
         self.workspace = workspace
 
-    # ── model memory management (spec adoption: no model stacking) ──────────────
-    def _ensure_only(self, model: str) -> None:
-        """Make *model* the only resident model before a call (when eviction is on).
+    def set_runtime(self, runtime: dict[str, RuntimeModelConfig]) -> None:
+        self.runtime = dict(runtime)
 
-        If a DIFFERENT model is currently warm, unload it first so the two never
-        stack in VRAM/RAM (which OOM-kills the Ollama runner on a 16GB-VRAM box and
-        surfaces as ``OllamaException {"error":"EOF"}``). A model re-called
-        consecutively (e.g. the implement/fix loop) is left warm. No-op when
-        ``evict_on_model_switch`` is false (big-memory box that can stack)."""
-        if not self.config.evict_on_model_switch:
+    def runtime_for(self, tier: str) -> RuntimeModelConfig:
+        rmc = self.runtime.get(tier)
+        if rmc is None:
+            raise LLMError(
+                f"no resolved runtime config for tier {tier!r} — model resolution must run "
+                "before any LLM call"
+            )
+        return rmc
+
+    # ── model memory management (one model resident at a time) ────────────────
+    def _ensure_only(self, model: str) -> None:
+        """Make *model* the only resident model before a call (when eviction is
+        on). A model re-called consecutively (the worker's implement/fix loop)
+        stays warm; a switch unloads the previous model first so the 21GB
+        manager and the worker can never stack in VRAM/RAM."""
+        if not self.config.ollama.evict_on_model_switch:
             return
         with self._mem_lock:
             prev = self._resident_model
@@ -150,7 +170,7 @@ class LLMClient:
 
     def unload_all(self) -> None:
         """Unload the resident model (called at pipeline end so nothing lingers)."""
-        if not self.config.evict_on_model_switch:
+        if not self.config.ollama.evict_on_model_switch:
             return
         with self._mem_lock:
             if self._resident_model:
@@ -160,12 +180,12 @@ class LLMClient:
     def _ollama_unload(self, model: str) -> None:
         """Ask Ollama to evict *model* immediately (keep_alive=0). Best-effort.
 
-        Skips the call if the model isn't actually loaded (per ``/api/ps``) so we
-        never reload a model just to unload it."""
-        name = (model or "").split("/", 1)[-1]  # strip the LiteLLM "ollama/" prefix
+        Skips the call if the model isn't actually loaded (per ``/api/ps``) so
+        we never reload a model just to unload it."""
+        name = (model or "").split("/", 1)[-1]  # tolerate a litellm-prefixed name
         if not name:
             return
-        base = (self.config.ollama_base_url or "http://localhost:11434").rstrip("/")
+        base = self.config.ollama.host
         try:
             ps = httpx.get(f"{base}/api/ps", timeout=10)
             if ps.status_code == 200:
@@ -183,66 +203,100 @@ class LLMClient:
     # ── main entry ────────────────────────────────────────────────────────────
     def complete(
         self,
+        tier: str,
         phase: str,
         messages: list[dict],
         *,
         stream: bool = True,
-        temperature: float = 0.2,
+        temperature: float | None = None,
         dump: bool = True,
+        dump_path: Path | None = None,
     ) -> CompletionResult:
-        model = self.config.model_for(phase)
-        mode = self.config.thinking_mode_for(phase)
-        prepared = self._apply_thinking(messages, mode)
+        """One completion for *tier*, labeled *phase* on every event.
+
+        ``dump_path`` (worker sessions) appends the call record to that file;
+        otherwise a fresh ``<timestamp>_<phase>.jsonl`` is created per call.
+        """
+        rmc = self.runtime_for(tier)
+        model = f"ollama_chat/{rmc.model}"
+        temp = rmc.temperature if temperature is None else temperature
+        prepared = [_clean_message(m) for m in messages]
 
         prompt_tokens = estimate_messages_tokens(prepared)
-        self.bus.llm_request(phase, model, prompt_tokens)
+        self.bus.llm_request(phase, rmc.model, prompt_tokens, tier=tier)
+        if tier == MANAGER:
+            from server import events
 
-        # Evict a different warm model first so two big models never stack (OOM/EOF).
-        self._ensure_only(model)
+            self.bus.emit(events.MANAGER_CALL_START, phase, model=rmc.model, prompt_token_estimate=prompt_tokens)
+
+        # Evict a different warm model first so two models never stack (OOM/EOF).
+        self._ensure_only(rmc.model)
 
         start = time.monotonic()
         try:
-            result = self._stream(phase, model, prepared, temperature) if stream else self._oneshot(
-                phase, model, prepared, temperature
+            result = (
+                self._stream(phase, model, rmc, prepared, temp)
+                if stream
+                else self._oneshot(phase, model, rmc, prepared, temp)
             )
         except LLMError:
             raise
         except Exception as exc:  # normalize any provider error
-            self.bus.error(f"LLM call failed: {exc}", context=f"phase={phase} model={model}", phase=phase)
+            self.bus.error(f"LLM call failed: {exc}", context=f"tier={tier} phase={phase} model={rmc.model}", phase=phase)
             raise LLMError(f"{phase}: {exc}") from exc
 
         result.duration = time.monotonic() - start
-        result.model = model
+        result.model = rmc.model
+        result.tier = tier
         result.phase = phase
         result.total_tokens = estimate_tokens(result.raw)
-        # Raw generation throughput: tokens / generation time (from first token to
-        # last), so a model's decode speed isn't diluted by load/prefill (important
-        # now that models are evicted+reloaded on switch). Falls back to total wall
-        # time for the non-streaming path. Surfaced on the event for the CLI + web UI.
+        # Raw generation throughput: tokens / generation time (first->last token)
+        # so decode speed isn't diluted by load/prefill (models are evicted +
+        # reloaded on switch). Falls back to wall time for the one-shot path.
         gen_dur = result.gen_duration or result.duration
         tps = round(result.total_tokens / gen_dur, 1) if gen_dur > 0 else 0.0
-        self.bus.llm_complete(phase, result.total_tokens, duration=round(result.duration, 2), tokens_per_second=tps)
+        self.bus.llm_complete(
+            phase, result.total_tokens, duration=round(result.duration, 2), tokens_per_second=tps, tier=tier
+        )
+        if tier == MANAGER:
+            from server import events
+
+            self.bus.emit(
+                events.MANAGER_CALL_END,
+                phase,
+                model=rmc.model,
+                total_tokens=result.total_tokens,
+                duration=round(result.duration, 2),
+                tokens_per_second=tps,
+            )
 
         if dump and self.config.dump_llm_calls:
-            self._dump(phase, model, prepared, result)
+            self._dump(tier, phase, rmc.model, prepared, result, dump_path)
         return result
 
-    # ── thinking-mode prompt shaping ──────────────────────────────────────────
-    def _apply_thinking(self, messages: list[dict], mode: str) -> list[dict]:
-        if mode in (THINK_NONE, THINK_DEEPSEEK):
-            return list(messages)  # deepseek thinks automatically; nothing to add
-        suffix = {THINK_QWEN3_ON: " /think", THINK_QWEN3_OFF: " /no_think"}.get(mode)
-        if not suffix:
-            return list(messages)
-        out = [dict(m) for m in messages]
-        for msg in reversed(out):
-            if msg.get("role") == "user":
-                msg["content"] = f"{msg.get('content', '')}{suffix}"
-                break
-        return out
+    # ── request options ───────────────────────────────────────────────────────
+    def _request_kwargs(self, rmc: RuntimeModelConfig, temperature: float) -> dict:
+        kwargs: dict = {
+            "api_base": self.config.ollama.host,
+            "api_key": "ollama",
+            "temperature": temperature,
+            "num_ctx": rmc.num_ctx,
+            # keep_alive keeps THIS model warm for the next same-model call; a
+            # different model evicts it explicitly first (_ensure_only), so the
+            # effective policy is dynamic rather than a fixed TTL.
+            "keep_alive": self.config.ollama.keep_alive,
+            "timeout": self.config.ollama.request_timeout,
+        }
+        # Only models that advertise the capability get the native think flag —
+        # sending it to a non-thinking model is an Ollama 400.
+        if rmc.supports_think_param:
+            kwargs["think"] = rmc.thinking_enabled
+        return kwargs
 
     # ── streaming ─────────────────────────────────────────────────────────────
-    def _stream(self, phase: str, model: str, messages: list[dict], temperature: float) -> CompletionResult:
+    def _stream(
+        self, phase: str, model: str, rmc: RuntimeModelConfig, messages: list[dict], temperature: float
+    ) -> CompletionResult:
         import litellm
 
         splitter = ThinkSplitter()
@@ -254,14 +308,9 @@ class LLMClient:
             model=model,
             messages=messages,
             stream=True,
-            api_base=self.config.ollama_base_url,
-            api_key="ollama",
-            temperature=temperature,
-            num_ctx=self.config.num_ctx,
-            keep_alive=self.config.keep_alive,  # 0 = unload after this call (no model stacking in RAM)
-            timeout=self.config.limits.sandbox_timeout * 30,
+            **self._request_kwargs(rmc, temperature),
         )
-        idle = max(30, int(self.config.limits.stream_idle_timeout))
+        idle = max(30, int(self.config.ollama.stream_idle_timeout))
         first_tok: float | None = None
         for chunk in _iter_with_idle_timeout(response, idle):
             content, reasoning = _chunk_parts(chunk)
@@ -297,54 +346,79 @@ class LLMClient:
             gen_duration=(time.monotonic() - first_tok) if first_tok is not None else 0.0,
         )
 
-    def _oneshot(self, phase: str, model: str, messages: list[dict], temperature: float) -> CompletionResult:
+    def _oneshot(
+        self, phase: str, model: str, rmc: RuntimeModelConfig, messages: list[dict], temperature: float
+    ) -> CompletionResult:
         import litellm
 
         response = litellm.completion(
             model=model,
             messages=messages,
             stream=False,
-            api_base=self.config.ollama_base_url,
-            api_key="ollama",
-            temperature=temperature,
-            num_ctx=self.config.num_ctx,
-            keep_alive=self.config.keep_alive,  # 0 = unload after this call (no model stacking in RAM)
+            **self._request_kwargs(rmc, temperature),
         )
         message = response.choices[0].message
         content = message.content or ""
         reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None) or ""
         text, inline_think = _strip_think(content)
-        thinking = (reasoning + ("\n" if reasoning and inline_think else "") + inline_think)
+        thinking = reasoning + ("\n" if reasoning and inline_think else "") + inline_think
         if thinking:
             self.bus.llm_thinking_token(phase, thinking)
         self.bus.llm_token(phase, text)
         return CompletionResult(text=text.strip(), thinking=thinking.strip(), raw=reasoning + content)
 
-    # ── debugging dump ────────────────────────────────────────────────────────
-    def _dump(self, phase: str, model: str, messages: list[dict], result: CompletionResult) -> None:
+    # ── debugging dump (JSONL) ────────────────────────────────────────────────
+    def _dump(
+        self,
+        tier: str,
+        phase: str,
+        model: str,
+        messages: list[dict],
+        result: CompletionResult,
+        dump_path: Path | None,
+    ) -> None:
         if self.workspace is None:
             return
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-        body = [f"# LLM call — {phase}", f"model: `{model}`", f"duration: {result.duration:.2f}s", ""]
-        body.append("## Prompt\n")
-        for msg in messages:
-            body.append(f"### {msg.get('role')}\n\n{msg.get('content','')}\n")
-        if result.thinking:
-            body.append("## Thinking\n\n```\n" + result.thinking + "\n```\n")
-        body.append("## Output\n\n" + result.text + "\n")
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tier": tier,
+            "phase": phase,
+            "model": model,
+            "duration_s": round(result.duration, 2),
+            "total_tokens": result.total_tokens,
+            "messages": messages,
+            "thinking": result.thinking,
+            "response": result.text,
+        }
         try:
-            (self.workspace.llm_calls_dir / f"{phase}_{ts}.md").write_text("\n".join(body), encoding="utf-8")
+            if dump_path is None:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+                dump_path = self.workspace.llm_calls_dir / tier / f"{ts}_{phase}.jsonl"
+            dump_path.parent.mkdir(parents=True, exist_ok=True)
+            with dump_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, default=str) + "\n")
         except OSError:
             pass
+
+    def session_dump_path(self, tier: str, label: str) -> Path | None:
+        """Path for a per-session JSONL dump (worker: one file per subtask)."""
+        if self.workspace is None:
+            return None
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in label) or "session"
+        return self.workspace.llm_calls_dir / tier / f"{ts}_{safe}.jsonl"
+
+
+def _clean_message(msg: dict) -> dict:
+    """Strip pipeline-internal keys (conversation bookkeeping) before sending."""
+    return {"role": msg.get("role", "user"), "content": str(msg.get("content", ""))}
 
 
 def _chunk_parts(chunk) -> tuple[str, str]:
     """Extract (content, reasoning_content) from a LiteLLM streaming chunk.
 
-    LiteLLM exposes a model's thinking via ``reasoning_content`` (or ``reasoning``)
-    on the delta, separate from the answer in ``content``. We read both so thinking
-    is captured whether the provider separates it or inlines ``<think>`` tags.
-    """
+    LiteLLM exposes Ollama's thinking via ``reasoning_content`` (or
+    ``reasoning``) on the delta, separate from the answer in ``content``."""
     try:
         choice = chunk.choices[0]
         delta = getattr(choice, "delta", None) or getattr(choice, "message", None)
@@ -368,14 +442,13 @@ def _strip_think(raw: str) -> tuple[str, str]:
 
 def _iter_with_idle_timeout(response, idle: float):
     """Yield streamed chunks, raising :class:`LLMError` if no chunk arrives for
-    *idle* seconds (spec adoption #7).
+    *idle* seconds.
 
-    This is an INTER-FRAME idle timeout — reset on every chunk — not an end-to-end
-    cap. A slow-but-alive local model doing long prefill on a big context keeps the
-    stream arriving, so only a stream gone genuinely silent trips it; a fixed total
-    timeout, by contrast, can't tell "slow but working" from "hung". The blocking
-    provider generator is drained on a daemon thread feeding a bounded queue, and the
-    consumer waits at most *idle* per item. Mirrors codehamr's streamIdleTimeout.
+    This is an INTER-FRAME idle timeout — reset on every chunk — not an
+    end-to-end cap. A slow-but-alive local model doing long prefill on a big
+    context keeps the stream arriving; only a stream gone genuinely silent
+    trips it. The blocking provider generator is drained on a daemon thread
+    feeding a bounded queue, and the consumer waits at most *idle* per item.
     """
     q: queue.Queue = queue.Queue(maxsize=64)
     sentinel = object()
@@ -397,7 +470,7 @@ def _iter_with_idle_timeout(response, idle: float):
         except queue.Empty:
             raise LLMError(
                 f"stream stalled: no tokens for {idle:.0f}s — the server may be hung "
-                f"(raise limits.stream_idle_timeout if the model legitimately needs longer to prefill)"
+                f"(raise ollama.stream_idle_timeout if the model legitimately needs longer to prefill)"
             )
         if item is sentinel:
             if "err" in box:

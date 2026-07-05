@@ -186,9 +186,10 @@ function CompletionSummary() {
         <h2 className="text-2xl font-semibold text-vs-text">{headline}</h2>
       </div>
 
-      <div className="mt-6 grid grid-cols-3 gap-3">
+      <div className="mt-6 grid grid-cols-4 gap-3">
         <Stat label="Subtasks done" value={state.done_count} accent="text-vs-green" />
         <Stat label="Blocked" value={state.blocked_count} accent="text-vs-red" />
+        <Stat label="Decomposed" value={state.decomposed_count} accent="text-vs-purple" />
         <Stat label="Total time" value={`${Math.round(totalTime)}s`} accent="text-vs-text" />
       </div>
 

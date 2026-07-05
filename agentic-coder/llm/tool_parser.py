@@ -1,17 +1,31 @@
-"""Tolerant tool-call parser (spec §11).
+"""Tolerant tool-call parser.
 
-Local models emit tool calls inconsistently. This parser accepts:
+Local models emit tool calls inconsistently. Parsing tries, in order (the
+redesign's mandated fallback chain):
 
-* ``<tool_call> {json} </tool_call>`` tag blocks,
-* ```` ```json `` / ```` ``` `` fenced code blocks,
-* raw JSON objects embedded in surrounding prose,
-* trailing commas, and
-* **raw (unescaped) newlines/tabs inside JSON string values** — the common case
-  for ``write_file`` content.
+1. ``<agentic_call> {json} </agentic_call>`` tag blocks (clean XML-tag parsing;
+   the legacy ``<tool_call>`` tag is also accepted here for backward
+   compatibility with old dumps/logs — see the WHY below),
+2. ```` ```json ``…``` ```` fenced code blocks,
+3. bare JSON objects with ``tool``/``args`` keys anywhere in the prose,
+4. schema-aware salvage for the common case of raw (unescaped) newlines/quotes
+   inside long string values (``write_file`` content, ``patch_file`` anchors).
 
-It extracts the *first* valid tool call. Key aliases are normalized:
-``tool``/``name`` for the tool, and ``args``/``arguments``/``parameters`` for
-the argument object.
+Key aliases are normalized: ``tool``/``name`` for the tool and
+``args``/``arguments``/``parameters`` for the argument object; the legacy
+``edit_file`` name is normalized to ``patch_file``.
+
+NOTE on the tag name: the Worker is prompted to use ``<agentic_call>``, NOT the
+more obvious ``<tool_call>``. ``<tool_call>...</tool_call>`` is the reserved
+native tool-calling delimiter for the qwen model family (ornith is a qwen3.5
+build) — Ollama's own renderer/parser recognizes that literal tag SERVER-SIDE
+and tries to lift it into ``message.tool_calls`` using its own name/arguments
+schema before this module ever sees the text. Our schema uses tool/args, so
+Ollama's native parser can't find what it expects, fails mid-parse (logged as
+"qwen tool call parsing failed error=EOF"), and the whole ``/api/chat``
+response comes back as ``{"error": "EOF"}`` instead of real content (litellm
+then raises a raw ``KeyError`` on the missing "message" key). Using a
+non-native tag keeps this entirely our own protocol.
 """
 
 from __future__ import annotations
@@ -23,10 +37,12 @@ from typing import Any
 
 _TOOL_KEYS = ("tool", "name", "tool_name", "function")
 _ARG_KEYS = ("args", "arguments", "parameters", "params", "input")
-_KNOWN_TOOLS = {"read_file", "write_file", "edit_file", "run"}
+_KNOWN_TOOLS = {"read_file", "write_file", "patch_file", "run"}
+# Old-name tolerance: a model that says edit_file means patch_file.
+_TOOL_ALIASES = {"edit_file": "patch_file"}
 
-_TAG_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL | re.IGNORECASE)
-_FENCE_RE = re.compile(r"```(?:json|tool_call|tool)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
+_TAG_RE = re.compile(r"<(agentic_call|tool_call)>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
+_FENCE_RE = re.compile(r"```(?:json|agentic_call|tool_call|tool)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 
 
@@ -39,8 +55,7 @@ class ToolCall:
     raw: str = ""
     # True when this call was reconstructed by _salvage_tool_call rather than
     # parsed cleanly — the strong signal that the server truncated the arguments
-    # mid-stream. The registry uses it to attach a heredoc-append recovery note so
-    # the model stops re-emitting the same too-large write (spec adoption #4).
+    # mid-stream. The registry uses it to attach a heredoc-append recovery note.
     salvaged: bool = False
 
     @property
@@ -55,32 +70,30 @@ def extract_tool_call(text: str) -> ToolCall | None:
 
 
 def extract_json(text: str) -> Any | None:
-    """Return the largest top-level JSON object found in *text*, tolerantly.
+    """Return the largest top-level JSON structure found in *text*, tolerantly.
 
-    Used by stages that expect a JSON document (e.g. the task planner). Strips
-    code fences, tolerates trailing commas and unescaped newlines, and picks the
-    longest balanced ``{...}`` that parses — which is almost always the intended
-    payload rather than a small inline example.
+    Used by stages that expect a JSON document (task planner, decomposition).
+    Strips code fences, tolerates trailing commas and unescaped newlines, and
+    picks the richest balanced structure that parses — which is almost always
+    the intended payload rather than a small inline example.
     """
     if not text:
         return None
-    # Prefer a fenced block if present (models often fence the JSON answer).
     candidates: list[str] = []
     for m in _FENCE_RE.finditer(text):
         candidates.extend(_json_objects(m.group(1)))
+        candidates.extend(_json_arrays(m.group(1)))
     candidates.extend(_json_objects(text))
+    candidates.extend(_json_arrays(text))
     parsed = [obj for blob in candidates if (obj := _loads_tolerant(blob)) is not None]
     parsed = [p for p in parsed if isinstance(p, (dict, list))]
     if not parsed:
         return None
-    # Heuristic: the richest structure (most keys/items) is the real document.
     return max(parsed, key=_richness)
 
 
 def _richness(obj: Any) -> int:
-    if isinstance(obj, dict):
-        return len(json.dumps(obj, default=str))
-    if isinstance(obj, list):
+    if isinstance(obj, (dict, list)):
         return len(json.dumps(obj, default=str))
     return 0
 
@@ -102,9 +115,9 @@ def extract_all_tool_calls(text: str, limit: int | None = None) -> list[ToolCall
             seen_spans.append(call.raw)
             found.append(call)
 
-    # 1) explicit <tool_call> tags (highest signal)
+    # 1) explicit <agentic_call> (or legacy <tool_call>) tags (highest signal)
     for m in _TAG_RE.finditer(text):
-        for cand in _json_objects(m.group(1)):
+        for cand in _json_objects(m.group(2)):
             _consider(cand)
 
     # 2) fenced code blocks
@@ -130,6 +143,11 @@ def extract_all_tool_calls(text: str, limit: int | None = None) -> list[ToolCall
 
 
 # ── internals ─────────────────────────────────────────────────────────────────
+def _normalize_name(name: str) -> str:
+    name = (name or "").strip()
+    return _TOOL_ALIASES.get(name, name)
+
+
 def _to_tool_call(obj: Any, raw: str) -> ToolCall | None:
     if not isinstance(obj, dict):
         return None
@@ -137,12 +155,12 @@ def _to_tool_call(obj: Any, raw: str) -> ToolCall | None:
     name = None
     for k in _TOOL_KEYS:
         if k in obj and isinstance(obj[k], str):
-            name = obj[k].strip()
+            name = _normalize_name(obj[k])
             break
     # OpenAI-ish shape: {"function": {"name": ..., "arguments": ...}}
     if name is None and isinstance(obj.get("function"), dict):
         fn = obj["function"]
-        name = (fn.get("name") or "").strip() or None
+        name = _normalize_name(fn.get("name") or "") or None
         args = fn.get("arguments")
         if isinstance(args, str):
             args = _loads_tolerant(args) or {}
@@ -167,16 +185,14 @@ def _to_tool_call(obj: Any, raw: str) -> ToolCall | None:
 def _salvage_tool_call(text: str) -> ToolCall | None:
     """Reconstruct a tool call from malformed JSON using the known schema.
 
-    Local models frequently emit ``write_file`` with code in ``content`` that
-    contains unescaped quotes/newlines (Python ``\"\"\"docstrings\"\"\"``,
-    ``print(\"x\")`` …), which makes the object invalid JSON. We anchor on the
-    known keys so embedded quotes in ``content`` don't matter, then unescape the
-    raw value. Better an imperfect file the fix-loop can repair than nothing.
+    Anchors on the known keys so embedded quotes in long values don't matter,
+    then unescapes the raw value. Better an imperfect file the fix-loop can
+    repair than losing the work entirely.
     """
-    m = re.search(r'"(?:tool|name|tool_name)"\s*:\s*"(read_file|write_file|edit_file|run)"', text, re.I)
+    m = re.search(r'"(?:tool|name|tool_name)"\s*:\s*"(read_file|write_file|patch_file|edit_file|run)"', text, re.I)
     if not m:
         return None
-    tool = m.group(1).lower()
+    tool = _normalize_name(m.group(1).lower())
 
     if tool == "write_file":
         path = _grab_scalar(text, "path")
@@ -188,7 +204,7 @@ def _salvage_tool_call(text: str) -> ToolCall | None:
         summary = _grab_scalar(text, "summary") or _grab_scalar(text, "description") or ""
         return ToolCall("write_file", {"path": path, "content": content, "summary": summary}, raw=text[:200], salvaged=True)
 
-    if tool == "edit_file":
+    if tool == "patch_file":
         path = _grab_scalar(text, "path")
         if path is None:
             return None
@@ -198,7 +214,7 @@ def _salvage_tool_call(text: str) -> ToolCall | None:
         new = _grab_between(text, "new_string", ("summary", "description", "path"))
         if old is None or new is None:
             return None
-        return ToolCall("edit_file", {"path": path, "old_string": old, "new_string": new}, raw=text[:200], salvaged=True)
+        return ToolCall("patch_file", {"path": path, "old_string": old, "new_string": new}, raw=text[:200], salvaged=True)
 
     if tool == "read_file":
         path = _grab_scalar(text, "path")
@@ -224,11 +240,8 @@ def _grab_content(text: str) -> str | None:
 def _grab_between(text: str, key: str, next_keys: tuple[str, ...]) -> str | None:
     """Extract a long string value for *key*, tolerating unescaped quotes/newlines.
 
-    The end is anchored on the next known key in *next_keys* or the closing of the
-    object, so quotes within embedded code don't terminate it early. Used for the
-    big free-form fields (write_file ``content``, edit_file ``old_string`` /
-    ``new_string``) that make a call un-parseable as strict JSON.
-    """
+    The end is anchored on the next known key in *next_keys* or the closing of
+    the object, so quotes within embedded code don't terminate it early."""
     m = re.search(rf'"{re.escape(key)}"\s*:\s*"', text)
     if not m:
         return None
@@ -261,6 +274,15 @@ def _unescape(s: str) -> str:
 
 def _json_objects(text: str) -> list[str]:
     """Yield balanced ``{...}`` substrings, respecting strings and escapes."""
+    return _balanced(text, "{", "}")
+
+
+def _json_arrays(text: str) -> list[str]:
+    """Yield balanced top-level ``[...]`` substrings (decomposition output)."""
+    return _balanced(text, "[", "]")
+
+
+def _balanced(text: str, open_ch: str, close_ch: str) -> list[str]:
     out: list[str] = []
     depth = 0
     start = -1
@@ -277,11 +299,11 @@ def _json_objects(text: str) -> list[str]:
             continue
         if ch == '"':
             in_str = True
-        elif ch == "{":
+        elif ch == open_ch:
             if depth == 0:
                 start = i
             depth += 1
-        elif ch == "}":
+        elif ch == close_ch:
             if depth > 0:
                 depth -= 1
                 if depth == 0 and start >= 0:
@@ -317,12 +339,7 @@ def _strip_trailing_commas(s: str) -> str:
 
 
 def _escape_control_chars(s: str) -> str:
-    """Escape literal newlines/tabs/CR that appear *inside* JSON string values.
-
-    Models frequently emit ``write_file`` content with real newlines inside the
-    JSON string, which is invalid JSON. This walks the text tracking string
-    state and replaces the offending control chars with their escape sequences.
-    """
+    """Escape literal newlines/tabs/CR that appear *inside* JSON string values."""
     out: list[str] = []
     in_str = False
     esc = False

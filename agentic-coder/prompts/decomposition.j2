@@ -1,0 +1,28 @@
+Subtask {{ subtask_id }} has exhausted its fix and escalation budget. Break it
+into 2-4 SMALLER micro-subtasks that together accomplish the same goal with a
+much tighter scope each — small enough that a small coding model can finish one
+in a short test-driven session.
+
+{{ context }}
+
+FULL FAILURE HISTORY:
+{{ failure_history }}
+
+Rules:
+- 2 to 4 micro-subtasks, each in the SAME schema as tasks.json subtasks.
+- Each has: id (use "{{ subtask_id }}.d1", "{{ subtask_id }}.d2", …), title,
+  type (scaffold|implement|integrate|config|install), intent (one sentence),
+  files (non-empty list of concrete file paths), dependencies (earlier micro-
+  subtask ids; the first may also depend on already-done subtasks), and
+  test_command (REQUIRED for implement/integrate types).
+- Order them so each builds on the previous. No cycles.
+- Use what the failure history taught you: isolate the part that kept failing
+  into its own micro-subtask with the narrowest possible test.
+
+Output ONLY a JSON array of the micro-subtask objects (no prose, no fences):
+
+[
+  {"id": "{{ subtask_id }}.d1", "title": "...", "type": "implement", "intent": "...",
+   "files": ["..."], "dependencies": [], "test_command": "..."},
+  ...
+]

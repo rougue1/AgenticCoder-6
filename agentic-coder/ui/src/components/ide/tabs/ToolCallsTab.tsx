@@ -7,7 +7,7 @@ import type { ToolCallRow } from '../../../types'
 
 const TOOL_COLOR: Record<string, string> = {
   write_file: 'text-vs-blue',
-  edit_file: 'text-vs-blue',
+  patch_file: 'text-vs-blue',
   read_file: 'text-vs-text-dim',
   run: 'text-vs-yellow',
 }
