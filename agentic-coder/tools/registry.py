@@ -1,12 +1,17 @@
-"""The four Worker tools + dispatch (redesign).
+"""The Worker tools + dispatch (bwrap redesign).
 
-* ``read_file``  ``{path}`` — jailed + .agentignore-checked read.
-* ``write_file`` ``{path, content, summary}`` — create/overwrite; ``summary``
+* ``read_file``      ``{path}`` — jailed + .agentignore-checked read.
+* ``write_file``     ``{path, content, summary}`` — create/overwrite; ``summary``
   is REQUIRED and recorded in the manifest; emits ``file_written``.
-* ``patch_file`` ``{path, old_string, new_string}`` — exact-match single
+* ``patch_file``     ``{path, old_string, new_string}`` — exact-match single
   replacement with precise diagnostics (zero matches / ambiguous / whitespace).
-* ``run``        ``{cmd, background?, timeout?, smoke?}`` — allowlist-validated,
-  venv-rewritten execution; background mode for dev servers.
+* ``run``            ``{cmd, background?, timeout?}`` — deny-list-checked
+  execution inside the bwrap OS sandbox (login shell, workspace-only writes).
+  Foreground blocks to completion; ``background: true`` starts a session and
+  returns its ``session_id`` immediately.
+* ``check_session``  ``{session_id}`` — status + captured output of a
+  background session (running or crashed).
+* ``stop_session``   ``{session_id}`` — terminate a background session.
 
 Every dispatch emits ``worker.tool_call`` then ``worker.tool_result``. The
 model never runs anything itself — it only requests; this layer validates and
@@ -15,14 +20,14 @@ executes.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from context.conversation import cap_tool_output
 from llm.tool_parser import ToolCall
-from tools.process_manager import ProcessManager
-from tools.sandbox import Sandbox
+from tools import formatters
+from tools.sandbox import Sandbox, SessionStatus
 from workspace import IgnoredPathError, PathEscapeError, Workspace
 
 if TYPE_CHECKING:
@@ -30,14 +35,14 @@ if TYPE_CHECKING:
     from server.events import EventBus
 
 # Description injected into Worker prompts so the model knows the protocol.
-# NOTE: the wrapper tag is <agentic_call>, NOT the more obvious <tool_call>.
+# NOTE: the wrapper tag is <agentic_call>, NOT the more obvious tool_call tag.
 # ornith (qwen3.5-family) is recognized by Ollama's own renderer/parser, which
-# natively scans raw output for the literal <tool_call>...</tool_call> markers
-# and tries to lift them into message.tool_calls using ITS OWN schema
-# (name/arguments) before we ever see the text. Our schema uses tool/args, so
-# Ollama's parser can't find what it expects, hits EOF mid-parse, and the whole
-# /api/chat response comes back as {"error": "EOF"} instead of real content
-# (litellm then dies with a raw KeyError on the missing "message" key). Using a
+# natively scans raw output for the literal qwen tool-call markers and tries to
+# lift them into message.tool_calls using ITS OWN schema (name/arguments)
+# before we ever see the text. Our schema uses tool/args, so Ollama's parser
+# can't find what it expects, hits EOF mid-parse, and the whole /api/chat
+# response comes back as {"error": "EOF"} instead of real content (litellm
+# then dies with a raw KeyError on the missing "message" key). Using a
 # non-native tag keeps this entirely our own protocol, parsed only by
 # llm/tool_parser.py.
 TOOL_INSTRUCTIONS = """\
@@ -60,13 +65,26 @@ Available tools:
    Prefer this over write_file for any change short of a full rewrite.
    <agentic_call>{"tool": "patch_file", "args": {"path": "src/app.py", "old_string": "def add(a, b):\\n    return a - b", "new_string": "def add(a, b):\\n    return a + b"}}</agentic_call>
 
-4. run — run a shell command in the project root. NEVER start a server in the
-   foreground (it would hang until killed): for dev servers/watchers set
-   "background": true and pass the verification calls as "smoke" commands — the
-   server is started in its own process, health-checked, the smoke commands run
-   against it concurrently, and it is stopped afterwards.
-   <agentic_call>{"tool": "run", "args": {"cmd": "pytest -q", "timeout": 120}}</agentic_call>
-   <agentic_call>{"tool": "run", "args": {"cmd": "uvicorn app.main:app --port 8100", "background": true, "smoke": ["curl -s http://127.0.0.1:8100/health"]}}</agentic_call>
+4. run — run a shell command in the project root. Full shell syntax works and
+   your user-level tools (node via nvm, pyenv pythons, …) are on PATH. Only
+   the project directory is writable. Two modes:
+   - FOREGROUND (default): blocks until the command finishes, returns
+     stdout/stderr/exit code. For tests, builds, installs, one-off commands.
+     Long-running server commands are REJECTED in foreground — see background.
+     <agentic_call>{"tool": "run", "args": {"cmd": "python -m pytest -q", "timeout": 120}}</agentic_call>
+   - BACKGROUND: set "background": true for anything that keeps running (dev
+     servers, watchers, databases). Returns a session_id immediately while the
+     process keeps running; then verify it with normal foreground commands
+     (curl, a test suite, …) and inspect it with check_session.
+     <agentic_call>{"tool": "run", "args": {"cmd": "uvicorn app.main:app --port 8100", "background": true}}</agentic_call>
+
+5. check_session — status of a background session: running or exited, its exit
+   code, and its captured output (server logs, crash traces).
+   <agentic_call>{"tool": "check_session", "args": {"session_id": "<id returned by run>"}}</agentic_call>
+
+6. stop_session — terminate a background session (e.g. to free its port before
+   restarting a reconfigured server).
+   <agentic_call>{"tool": "stop_session", "args": {"session_id": "<id>"}}</agentic_call>
 
 Rules:
 - All paths are relative to the project root. Never use absolute paths, "..",
@@ -78,6 +96,11 @@ Rules:
   requirements.txt`. Writing the manifest file does not install anything.
 - write_file writes COMPLETE file contents, never diffs or "... unchanged ...".
 - To change a file that already exists, prefer patch_file over rewriting it.
+- Background processes run in their own PID namespace: `kill <pid>` cannot
+  reach them — use stop_session. All sessions are terminated automatically
+  when this subtask ends; stop_session servers you started once you are done
+  verifying against them (a leftover server can hold the port the final test
+  run needs).
 - For a LARGE new file (more than a few hundred lines) build it with run + bash
   heredoc appends from the FIRST call (`cat > path <<'EOF' ... EOF`, then a
   `cat >> path <<'EOF' ... EOF` per part) — a single huge write_file body can be
@@ -96,14 +119,7 @@ _TRUNCATED_ARGS_NOTE = (
     "… EOF` for the first part, then a `cat >> <path> <<'EOF' … EOF` per following part."
 )
 
-# Foreground commands that would block forever (dev servers). Auto-routed to the
-# background harness so the pipeline never hangs on `uvicorn app:app`.
-_SERVER_CMD_RE = re.compile(
-    r"^\s*(?:\S*/)?(?:uvicorn|gunicorn|flask\s+run|python\d?\s+-m\s+(?:uvicorn|flask|http\.server)|"
-    r"npm\s+(?:run\s+)?(?:dev|start|serve)|npx\s+(?:vite|next|serve)|node\s+\S*server\S*|"
-    r"yarn\s+(?:dev|start)|pnpm\s+(?:dev|start)|vite\b|next\s+dev)",
-    re.I,
-)
+_VALID_TOOLS_LINE = "Valid tools: read_file, write_file, patch_file, run, check_session, stop_session."
 
 
 @dataclass
@@ -126,13 +142,11 @@ class ToolRegistry:
         sandbox: Sandbox,
         manifest: "Manifest",
         bus: "EventBus",
-        process_manager: ProcessManager,
     ):
         self.workspace = workspace
         self.sandbox = sandbox
         self.manifest = manifest
         self.bus = bus
-        self.process_manager = process_manager
 
     # ── dispatch ──────────────────────────────────────────────────────────────
     def dispatch(self, call: ToolCall, phase: str) -> ToolResult:
@@ -142,13 +156,15 @@ class ToolRegistry:
             "write_file": self._write_file,
             "patch_file": self._patch_file,
             "run": self._run,
+            "check_session": self._check_session,
+            "stop_session": self._stop_session,
         }.get(call.name)
         if handler is None:
             result = ToolResult(
                 tool=call.name,
                 ok=False,
                 payload={"error": f"unknown tool {call.name!r}"},
-                display=f"ERROR: unknown tool {call.name!r}. Valid tools: read_file, write_file, patch_file, run.",
+                display=f"ERROR: unknown tool {call.name!r}. {_VALID_TOOLS_LINE}",
             )
         else:
             result = handler(call.args, phase)
@@ -223,12 +239,17 @@ class ToolRegistry:
 
         rel = self.workspace.relative(path)
         self.manifest.record(rel, summary)
-        self.bus.file_written(phase, rel, action, content=content)
+        # Feature 4 — post-execution formatting hook: silent, best-effort, never
+        # blocks. The Worker never sees that formatting happened; we re-read the
+        # file so the event/manifest/display bytes reflect the formatted content.
+        formatters.format_file(self.sandbox, rel, self.bus, phase)
+        final_content = _read_after_format(target, content)
+        self.bus.file_written(phase, rel, action, content=final_content)
         return ToolResult(
             tool="write_file",
             ok=True,
-            payload={"path": rel, "action": action, "bytes": len(content)},
-            display=f"Wrote {rel} ({action}, {len(content)} bytes).",
+            payload={"path": rel, "action": action, "bytes": len(final_content)},
+            display=f"Wrote {rel} ({action}, {len(final_content)} bytes).",
         )
 
     # ── patch_file ────────────────────────────────────────────────────────────
@@ -293,11 +314,15 @@ class ToolRegistry:
 
         rel = self.workspace.relative(path)
         self.manifest.record(rel, args.get("summary") or args.get("description"))
-        self.bus.file_written(phase, rel, "edit", content=updated)
+        # Feature 4 — post-execution formatting hook (see _write_file for the
+        # full rationale); re-read so the reported bytes reflect the formatted file.
+        formatters.format_file(self.sandbox, rel, self.bus, phase)
+        final_content = _read_after_format(target, updated)
+        self.bus.file_written(phase, rel, "edit", content=final_content)
         return ToolResult(
             tool="patch_file",
             ok=True,
-            payload={"path": rel, "action": "edit", "bytes": len(updated)},
+            payload={"path": rel, "action": "edit", "bytes": len(final_content)},
             display=f"Patched {rel} (-{len(old)} +{len(new)} bytes).",
         )
 
@@ -309,43 +334,27 @@ class ToolRegistry:
             return _err("run", "missing required arg 'cmd'")
         background = bool(args.get("background", False))
         timeout = args.get("timeout")
-        smoke = args.get("smoke") or args.get("smoke_cmds") or []
-        if isinstance(smoke, str):
-            smoke = [smoke]
 
         note = ""
-        if not background and _SERVER_CMD_RE.match(cmd.strip()):
-            # A foreground dev server would block until the timeout kills it.
-            # Route it through the background harness instead so the pipeline
-            # never hangs on a long-running process.
-            background = True
+        if args.get("smoke") or args.get("smoke_cmds"):
+            # The pre-bwrap harness took "smoke" commands; sessions replaced it.
             note = (
-                "\n[note] this looks like a long-running server, so it was started in the "
-                "background, health-checked, and stopped. Pass \"smoke\" commands to test it."
-            )
-
-        try:
-            self.sandbox.validate(cmd)
-        except Exception as exc:  # CommandRejected
-            reason = getattr(exc, "reason", str(exc))
-            return ToolResult(
-                tool="run",
-                ok=False,
-                payload={"cmd": cmd, "exit_code": 126, "rejected": True, "reason": reason},
-                display=f"COMMAND REJECTED ({reason}): {cmd}",
+                '\n[note] "smoke" is no longer a run argument. The background session keeps '
+                "running: verify it yourself with foreground run calls (curl …) and "
+                "check_session, then stop_session when done."
             )
 
         if background:
-            result = self.process_manager.run_background_check(
-                cmd,
-                health_timeout=self.sandbox.limits.long_process_timeout,
-                smoke_cmds=list(smoke),
-                smoke_timeout=int(timeout) if timeout else self.sandbox.limits.timeout,
-            )
-        else:
-            result = self.sandbox.run(cmd, timeout=int(timeout) if timeout else None)
+            return self._run_background(cmd, note)
 
-        display = _render_run(cmd, result, background) + note
+        result = self.sandbox.run(cmd, timeout=int(timeout) if timeout else None)
+        if result.rejected:
+            return ToolResult(
+                tool="run",
+                ok=False,
+                payload={"cmd": cmd, "exit_code": result.exit_code, "rejected": True, "reason": result.reason},
+                display=f"COMMAND REJECTED ({result.reason}): {cmd}",
+            )
         return ToolResult(
             tool="run",
             ok=result.ok,
@@ -356,15 +365,100 @@ class ToolRegistry:
                 "stderr": result.stderr,
                 "duration": round(result.duration, 3),
                 "timed_out": result.timed_out,
-                "background": background,
+                "background": False,
             },
-            display=display,
+            display=_render_run(cmd, result, background=False) + note,
+        )
+
+    def _run_background(self, cmd: str, note: str = "") -> ToolResult:
+        start = self.sandbox.run_background(cmd)
+        if start.rejected:
+            return ToolResult(
+                tool="run",
+                ok=False,
+                payload={"cmd": cmd, "exit_code": 126, "rejected": True, "reason": start.reason, "background": True},
+                display=f"COMMAND REJECTED ({start.reason}): {cmd}",
+            )
+        if not start.session_id:
+            return _err("run", f"could not start background session: {start.reason}")
+
+        payload = {
+            "cmd": cmd,
+            "background": True,
+            "session_id": start.session_id,
+            "running": start.running,
+            "exit_code": start.exit_code,
+            "log_path": start.log_path,
+            "output": start.output,
+        }
+        lines = [f"$ {cmd}"]
+        if start.running:
+            lines.append(f"[background] started, session_id={start.session_id} (still running)")
+            if start.output.strip():
+                lines.append(f"--- early output ---\n{start.output}")
+            lines.append(
+                "Verify it with foreground run calls (e.g. curl), inspect with check_session "
+                f'{{"session_id": "{start.session_id}"}}, terminate with stop_session.'
+            )
+        elif start.exit_code == 0:
+            lines.append(
+                f"[background] session_id={start.session_id} exited immediately with code 0 — "
+                "it finished (or daemonized) instead of staying in the foreground of its session."
+            )
+            lines.append(f"--- output ---\n{start.output or '(no output captured)'}")
+        else:
+            lines.append(
+                f"[background] session_id={start.session_id} EXITED IMMEDIATELY with code {start.exit_code} "
+                "— it did not stay running. Diagnose from its output below (port already in use? "
+                "bad flag? missing dependency?) and fix before retrying."
+            )
+            lines.append(f"--- output ---\n{start.output or '(no output captured)'}")
+        return ToolResult(tool="run", ok=start.ok, payload=payload, display="\n".join(lines) + note)
+
+    # ── check_session / stop_session ──────────────────────────────────────────
+    def _check_session(self, args: dict, phase: str) -> ToolResult:
+        session_id = str((args or {}).get("session_id") or "").strip()
+        if not session_id:
+            return _err("check_session", "missing required arg 'session_id'")
+        status = self.sandbox.check_session(session_id)
+        if not status.exists:
+            return _err("check_session", status.detail)
+        ok = status.running or status.exit_code == 0
+        return ToolResult(
+            tool="check_session",
+            ok=ok,
+            payload=_session_payload(status),
+            display=_render_session(status),
+        )
+
+    def _stop_session(self, args: dict, phase: str) -> ToolResult:
+        session_id = str((args or {}).get("session_id") or "").strip()
+        if not session_id:
+            return _err("stop_session", "missing required arg 'session_id'")
+        status = self.sandbox.stop_session(session_id)
+        if not status.exists:
+            return _err("stop_session", status.detail)
+        return ToolResult(
+            tool="stop_session",
+            ok=True,
+            payload=_session_payload(status),
+            display=f"Session {status.session_id} terminated.\n" + _render_session(status),
         )
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
 def _err(tool: str, message: str) -> ToolResult:
     return ToolResult(tool=tool, ok=False, payload={"error": message}, display=f"ERROR: {message}")
+
+
+def _read_after_format(target: Path, fallback: str) -> str:
+    """Re-read *target* after the formatting hook (Feature 4); *fallback* (the
+    content this call itself just wrote) covers a formatter that deleted the
+    file or a transient read error — writing/patching must never fail here."""
+    try:
+        return target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return fallback
 
 
 def _differs_only_in_whitespace(content: str, old: str) -> bool:
@@ -378,10 +472,30 @@ def _differs_only_in_whitespace(content: str, old: str) -> bool:
 def _event_payload(result: ToolResult) -> dict:
     """Pick the fields worth putting on the tool_result event (trim big stdout)."""
     p = dict(result.payload)
-    for key in ("stdout", "stderr"):
+    for key in ("stdout", "stderr", "output"):
         if isinstance(p.get(key), str) and len(p[key]) > 2000:
             p[key] = p[key][:2000] + " …<truncated>"
     return p
+
+
+def _session_payload(status: SessionStatus) -> dict:
+    return {
+        "session_id": status.session_id,
+        "running": status.running,
+        "exit_code": status.exit_code,
+        "uptime": round(status.uptime, 1),
+        "cmd": status.cmd,
+        "output": status.output,
+    }
+
+
+def _render_session(status: SessionStatus) -> str:
+    if status.running:
+        head = f"[session {status.session_id}] RUNNING for {status.uptime:.1f}s: {status.cmd}"
+    else:
+        head = f"[session {status.session_id}] EXITED with code {status.exit_code}: {status.cmd}"
+    body = status.output.strip() or "(no output captured yet)"
+    return f"{head}\n--- captured output (tail) ---\n{body}"
 
 
 def _render_run(cmd: str, result, background: bool) -> str:

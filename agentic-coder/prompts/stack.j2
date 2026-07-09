@@ -15,14 +15,10 @@ keys:
 {
   "stack": "<short stack name, e.g. python-fastapi or node-express>",
   "python_version": "<preferred version like 3.12 if Python-based, else \"\">",
-  "allowed_commands": ["<every shell executable the coding agent may run for this stack, e.g. python, pip, pytest, uvicorn>"],
   "agentignore": ["<ignore patterns appropriate for this stack, gitignore syntax, e.g. __pycache__/, *.pyc>"],
   "brief": "<a concise project brief: one paragraph interpreting the request, then goals, scope in/out, and measurable success criteria — plain text with \\n newlines>"
 }
 
 Rules:
-- allowed_commands lists bare executable names only (no arguments). Include the
-  language runtime, package manager, test runner, and any server/lint/format
-  tools the project will legitimately need. Never include git, sudo, curl|sh.
 - Keep the brief tight and unambiguous; do not invent features the user did not
   imply.

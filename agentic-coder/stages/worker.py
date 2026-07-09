@@ -33,6 +33,7 @@ from context.conversation import compress_conversation, pack_conversation
 from llm.tool_parser import ToolCall, extract_all_tool_calls
 from server import events
 from services import Services
+from stages import roles as roles_stage
 from tools.registry import TOOL_INSTRUCTIONS
 
 _MAX_STEPS = 48          # hard cap on model turns per drive() call
@@ -55,6 +56,13 @@ _TDD_CORRECTION = (
     "NOT executed."
 )
 
+# Feature 1 (findings.md): asked once per failed verification, in the same
+# conversation, so the Worker has full context of what it just attempted.
+FINDINGS_PROMPT = (
+    "In one sentence, summarize what went wrong and the key learning from this "
+    "failure. Reply with PLAIN TEXT ONLY — do not emit a tool call for this."
+)
+
 # Non-negotiable rules injected into every Worker call. These encode failure
 # modes seen with local models — chiefly imports that don't match the layout.
 HARD_RULES = """\
@@ -74,9 +82,12 @@ HARD_RULES = """\
   placeholders. Tests must import the real modules and assert real behavior.
 - To change an EXISTING file use patch_file with a unique anchor; do not
   rewrite the whole file to change a few lines.
-- NEVER run a blocking/foreground server (uvicorn, npm run dev, …). To verify a
-  server, use run with "background": true plus "smoke" commands — the server is
-  started in another process, your smoke calls run against it, then it is stopped.
+- NEVER run a server/watcher in the foreground (uvicorn, npm run dev, …) — the
+  sandbox rejects it because it would block forever. Start it with run
+  {"background": true} (you get a session_id back while it keeps running),
+  verify it with normal foreground commands (curl …), inspect its logs with
+  check_session, and stop_session it when you are done — a leftover server can
+  hold the port the final verification needs.
 - Never make a check pass dishonestly: no `|| true`, no `2>/dev/null` to hide a
   real error, no deleting or weakening an assertion to go green.
 - Never use git, absolute paths, `..`, or `~`."""
@@ -108,16 +119,17 @@ class WorkerSession:
         self.subtask = subtask
         self.phase = "worker"
         self.subtask_id = str(subtask.get("id", ""))
+        self.role = str(subtask.get("role") or "").strip().lower()
         self.tdd_enforced = str(subtask.get("type", "")).lower() in ("implement", "integrate")
         self.test_file_written = False
         self.tdd_corrections = 0
         self.files_touched: set[str] = set()
+        self.last_call_ok = True  # Feature 5 (completion gate): last tool dispatch's ok flag
         self.attempt = 0  # test attempts, for tool-result bookkeeping
         self.dump_path = services.client.session_dump_path(WORKER, self.subtask_id)
         self.messages: list[dict] = [
-            {"role": "system", "content": self._system_prompt()},
+            {"role": "system", "content": self._system_prompt(instructions)},
         ]
-        self._instructions = instructions
         services.bus.emit(
             events.WORKER_CALL_START,
             self.phase,
@@ -133,7 +145,6 @@ class WorkerSession:
             subtask_id=self.subtask_id,
             subtask_title=str(self.subtask.get("title", "")),
             subtask_type=str(self.subtask.get("type", "")),
-            instructions=self._instructions,
             tdd=self.tdd_enforced,
         )
         return self._drive(instruction)
@@ -163,6 +174,45 @@ class WorkerSession:
             max_attempts=max_attempts,
         )
         return self._drive(instruction)
+
+    def address_review(self, issues: list[str]) -> bool:
+        """Feature 3 — inject the Manager-as-Reviewer's issues and drive one
+        more turn (the single review-fix cycle; reuses the normal tool-call
+        loop machinery)."""
+        numbered = "\n".join(f"{i}. {issue}" for i, issue in enumerate(issues, start=1))
+        instruction = (
+            "Code review identified the following issues that must be addressed before "
+            f"this subtask can be marked complete:\n{numbered}\n\nUse tool calls — one per "
+            "message. When done, reply with the single line: DONE."
+        )
+        return self._drive(instruction)
+
+    def address_completion_gate(self, failed_conditions: list[str]) -> bool:
+        """Feature 5 — inject the gate's specific failures and drive one more
+        turn (reuses the normal tool-call loop)."""
+        desc = "; ".join(failed_conditions)
+        instruction = (
+            f"COMPLETION GATE FAILED: {desc}. Address this before this subtask can be "
+            "marked complete.\n\nUse tool calls — one per message. When done, reply with "
+            "the single line: DONE."
+        )
+        return self._drive(instruction)
+
+    def summarize_failure(self) -> str:
+        """Feature 1 — one plain-text turn (no tool call): a one-line failure
+        summary for the shared ``.agent/findings.md`` log. Appended to the
+        running conversation so the Worker has full context of the failure it
+        just hit; does not consume the ``_drive()`` step/correction budgets."""
+        svc = self.services
+        self.messages.append({"role": "user", "content": FINDINGS_PROMPT})
+        rmc = svc.client.runtime_for(WORKER)
+        packed = pack_conversation(self.messages, rmc.max_tokens)
+        result = svc.client.complete(WORKER, self.phase, packed, dump_path=self.dump_path)
+        reply = (result.text or result.raw).strip()
+        self.messages.append({"role": "assistant", "content": reply})
+        if not reply or "<agentic_call" in reply.lower():
+            return ""
+        return reply
 
     # ── conversation driver ───────────────────────────────────────────────────
     def _drive(self, instruction: str) -> bool:
@@ -211,7 +261,10 @@ class WorkerSession:
                 self.messages.append(
                     {
                         "role": "user",
-                        "content": f"Unknown tool {call.name!r}. Use only read_file, write_file, patch_file, or run.",
+                        "content": (
+                            f"Unknown tool {call.name!r}. Use only read_file, write_file, "
+                            "patch_file, run, check_session, or stop_session."
+                        ),
                     }
                 )
                 continue
@@ -270,6 +323,7 @@ class WorkerSession:
         return True
 
     def _track(self, call: ToolCall, tr) -> None:
+        self.last_call_ok = bool(tr.ok)  # Feature 5 (completion gate)
         if call.name in ("write_file", "patch_file") and tr.ok:
             rel = str(tr.payload.get("path") or (call.args or {}).get("path") or "")
             if rel:
@@ -277,8 +331,22 @@ class WorkerSession:
                 if is_test_path(rel):
                     self.test_file_written = True
 
-    def _system_prompt(self) -> str:
-        return (
+    def _system_prompt(self, instructions: str) -> str:
+        """Feature 2 — three layers, always in this order: the anchor (immutable,
+        pinned by pack_conversation as the system message), the role-specific
+        instructions for this subtask's role (falls back to backend.md, or is
+        omitted entirely if no role files exist yet), then the Manager's
+        handoff instructions for THIS subtask. The generic agent identity +
+        tool protocol always comes last."""
+        anchor = self.services.workspace.read_anchor_text() if self.services.workspace else ""
+        role_text = roles_stage.read_role(self.services, self.role)
+        parts: list[str] = []
+        if anchor:
+            parts.append(anchor)
+        if role_text:
+            parts.append(f"# Role: {self.role or roles_stage.DEFAULT_ROLE}\n\n{role_text}")
+        parts.append(f"# Instructions for this subtask\n\n{instructions}")
+        parts.append(
             "You are an expert coding agent in an autonomous build pipeline. You "
             "implement exactly one subtask by emitting tool calls, one per message. "
             "You write complete, working files that obey the rules below.\n\n"
@@ -286,6 +354,7 @@ class WorkerSession:
             + "\n\n# Tool Protocol\n"
             + TOOL_INSTRUCTIONS
         )
+        return "\n\n".join(parts)
 
 
 def says_done(text: str) -> bool:

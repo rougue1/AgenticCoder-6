@@ -16,6 +16,14 @@ STEP B  Worker TDD loop — a stateful conversation (``stages/worker``) writes
                    subtasks, injected once)    x max_decompositions
                   -> hard block (+ cascade to dependents)
 
+        Every failed verification also gets a one-line Worker-written entry in
+        the shared ``.agent/findings.md`` log (Feature 1). Once tests pass,
+        implement/integrate subtasks get one Manager-as-Reviewer code-review
+        cycle (Feature 3, at most once per subtask) and then the completion
+        gate (Feature 5) before the subtask is marked done; either failing
+        feeds back into the SAME fix-retry budget as a test failure, and
+        exhausting it escalates exactly like a test failure would.
+
 STEP C  Post-task summarization — every file the subtask touched gets a
         Manager-as-Analyst summary; install subtasks get a silent dependency
         conflict check; every test run lands in ``test_results.jsonl``
@@ -25,13 +33,15 @@ STEP C  Post-task summarization — every file the subtask touched gets a
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from orchestrator import completion_gate
 from orchestrator.states import SubtaskOutcome
 from server import events
 from services import Services
-from stages import manager, summarizer
+from stages import code_review, manager, summarizer
 from stages.worker import WorkerSession
 from taskstore import BLOCKED, DECOMPOSED, DONE, IN_PROGRESS, TaskStore
 
@@ -51,6 +61,22 @@ _MANIFEST_INSTALL = [
 # Subtask types under TDD enforcement (pytest exit 5 = "no tests collected" is a
 # FAILURE for these — a green empty suite would silently defeat tests-first).
 _TDD_TYPES = ("implement", "integrate")
+
+# Feature 3: subtask types worth a code-review cycle — scaffold/config/install
+# don't produce logic code worth reviewing (same set as _TDD_TYPES today, kept
+# as its own name since the two concerns are independent).
+_REVIEW_TYPES = ("implement", "integrate")
+
+_SENTENCE_RE = re.compile(r"^(.*?[.!?])(?:\s|$)")
+
+
+def _first_sentence(text: str) -> str:
+    """Feature 1 — collapse to one line and keep only the first sentence."""
+    flat = " ".join((text or "").split())
+    if not flat:
+        return ""
+    m = _SENTENCE_RE.match(flat)
+    return (m.group(1) if m else flat).strip()
 
 
 @dataclass
@@ -117,6 +143,25 @@ class SubtaskLoop:
 
     # ── one subtask through the ladder ────────────────────────────────────────
     def _process_subtask(self, store: TaskStore, task: dict, sub: dict) -> SubtaskOutcome:
+        """Run one subtask through the ladder. Whatever the outcome (done,
+        blocked, decomposed, cancel/crash), every background session the
+        Worker started is terminated on the way out — no server survives the
+        subtask that started it."""
+        try:
+            return self._process_subtask_inner(store, task, sub)
+        finally:
+            self._terminate_sessions("subtask boundary")
+
+    def _terminate_sessions(self, reason: str) -> None:
+        sandbox = self.services.sandbox
+        if sandbox is None:
+            return
+        try:
+            sandbox.terminate_sessions(reason)
+        except Exception as exc:  # cleanup must never mask the subtask outcome
+            self.bus.log(f"session cleanup failed: {exc}", phase="subtask_loop", level="warn")
+
+    def _process_subtask_inner(self, store: TaskStore, task: dict, sub: dict) -> SubtaskOutcome:
         sid = sub["id"]
         store.set_status(sid, IN_PROGRESS)
         self.services.progress.begin_subtask(sub)
@@ -125,6 +170,9 @@ class SubtaskLoop:
         failures: list[FailureRecord] = []
         escalations_left = self.cfg.max_escalations
         attempt = 0
+        # Feature 3: one review cycle for the WHOLE subtask (never reset by
+        # escalation) — the explicit anti-infinite-review-loop guarantee.
+        review_done = False
 
         # STEP A — Manager handoff.
         self.services.progress.activity = "handoff"
@@ -138,17 +186,36 @@ class SubtaskLoop:
             session.implement()
 
             fix_left = self.cfg.max_fix_retries
-            while True:  # test / fix loop (one Worker conversation)
+            while True:  # test / fix / review / gate loop (one Worker conversation)
                 self.services.check_cancel()
                 attempt += 1
                 session.attempt = attempt
                 self.services.progress.activity = "test"
                 verify = self._verify(sub)
 
+                # Once tests pass: one code-review cycle (Feature 3, at most
+                # once per subtask), then the completion gate (Feature 5).
+                # Both are skipped (post_pass_ok stays True) once review is
+                # already done / not applicable, or the gate already ran this
+                # iteration and passed.
+                review_result = None
+                gate_result = None
+                post_pass_ok = True
+                if verify.passed:
+                    if not review_done and str(sub.get("type") or "").lower() in _REVIEW_TYPES:
+                        review_done = True
+                        review_result = self._run_review(sub, session)
+                        post_pass_ok = review_result.approved
+                    if post_pass_ok:
+                        gate_result = completion_gate.check(self.services, sub, session)
+                        self._emit_completion_check(sid, gate_result)
+                        post_pass_ok = gate_result.passed
+
                 escalation_round = self.cfg.max_escalations - escalations_left
-                # Final = passed, or the last rung of the ladder (decomposition/
-                # block both end THIS subtask's test history).
-                is_final = verify.passed or (fix_left <= 0 and escalations_left <= 0)
+                # Final = passed with review+gate both clear, or the last rung
+                # of the ladder (decomposition/block both end THIS subtask's
+                # test history).
+                is_final = (verify.passed and post_pass_ok) or (fix_left <= 0 and escalations_left <= 0)
                 self._log_test_result(sid, verify, attempt, is_final=is_final, escalation=escalation_round)
                 self.bus.test_run(
                     "subtask_loop",
@@ -158,10 +225,51 @@ class SubtaskLoop:
                     output=_tail(((verify.stderr or "") + ("\n" + verify.stdout if verify.stdout else "")).strip(), 1500),
                 )
 
-                if verify.passed:
+                if verify.passed and post_pass_ok:
                     self._finish_done(store, sub, session)
                     return SubtaskOutcome.DONE
 
+                if verify.passed and not post_pass_ok:
+                    # Tests passed but the review and/or completion gate
+                    # didn't: address it and re-verify, spending the SAME
+                    # fix-retry budget a test failure would.
+                    if fix_left > 0:
+                        fix_left -= 1
+                        fix_no = self.cfg.max_fix_retries - fix_left
+                        self.bus.emit(
+                            events.WORKER_FIX_ATTEMPT,
+                            "subtask_loop",
+                            id=sid,
+                            attempt=fix_no,
+                            exit_code=verify.exit_code,
+                        )
+                        self.services.progress.activity = "fix"
+                        if review_result is not None and not review_result.approved:
+                            session.address_review(review_result.issues)
+                        elif gate_result is not None and not gate_result.passed:
+                            session.address_completion_gate(gate_result.failed_conditions)
+                        continue
+                    # Fix budget exhausted: same fate as an exhausted test
+                    # failure — fall through to escalate/decompose/block,
+                    # with a synthetic failure record so escalation has
+                    # something concrete to diagnose.
+                    failed_list = (
+                        (review_result.issues if review_result else [])
+                        + (gate_result.failed_conditions if gate_result else [])
+                    )
+                    failures.append(
+                        FailureRecord(
+                            attempt=len(failures) + 1,
+                            cmd=verify.cmd or "(post-pass checks)",
+                            exit_code=1,
+                            stdout="",
+                            stderr="Post-pass checks failed:\n" + "\n".join(failed_list),
+                            note="Tests passed but code review/completion gate failed and fix retries are exhausted.",
+                        )
+                    )
+                    break  # -> escalate / decompose / block
+
+                # verify.passed is False: the ordinary test-failure path.
                 failures.append(
                     FailureRecord(
                         attempt=len(failures) + 1,
@@ -172,6 +280,7 @@ class SubtaskLoop:
                         note="" if verify.cmd else "Subtask declared no runnable test command.",
                     )
                 )
+                self._record_finding(sid, session)
 
                 if fix_left > 0:
                     fix_left -= 1
@@ -207,6 +316,10 @@ class SubtaskLoop:
                     escalations_left=escalations_left,
                     failures=len(failures),
                 )
+                # The fresh conversation knows nothing about the old attempt's
+                # sessions; kill them so stale servers can't hold ports or serve
+                # stale code against the new plan.
+                self._terminate_sessions("escalation — fresh plan")
                 instructions = manager.escalate(self.services, sub, history, store)
                 continue
 
@@ -350,6 +463,57 @@ class SubtaskLoop:
         self.services.workspace.write_agent_doc("blocked.md", existing.rstrip() + "\n\n" + record)
         self._summarize_session(sub, session)
         self.bus.emit(events.TASK_BLOCKED, "subtask_loop", id=sid, attempts=len(failures), cascaded=cascaded)
+
+    # ── Feature 3: per-subtask code review ────────────────────────────────────
+    def _run_review(self, sub: dict, session: WorkerSession) -> code_review.ReviewResult:
+        sid = sub["id"]
+        self.services.progress.activity = "review"
+        self.bus.emit(events.TASK_REVIEW_START, "subtask_loop", id=sid)
+        result = code_review.run(self.services, sub, sorted(session.files_touched))
+        self.bus.emit(
+            events.TASK_REVIEW_COMPLETE,
+            "subtask_loop",
+            id=sid,
+            status="approved" if result.approved else "issues_found",
+            count=len(result.issues),
+        )
+        self.bus.log(
+            f"review approved for {sid}"
+            if result.approved
+            else f"review: {len(result.issues)} issues found for {sid}, worker addressing.",
+            phase="subtask_loop",
+        )
+        return result
+
+    # ── Feature 5: completion gate ────────────────────────────────────────────
+    def _emit_completion_check(self, sid: str, gate_result: completion_gate.GateResult) -> None:
+        self.bus.emit(
+            events.TASK_COMPLETION_CHECK,
+            "subtask_loop",
+            id=sid,
+            status="passed" if gate_result.passed else "failed",
+            failed_conditions=gate_result.failed_conditions,
+        )
+        if not gate_result.passed:
+            self.bus.log(
+                f"completion gate: {len(gate_result.failed_conditions)} issue(s) for {sid}, worker addressing.",
+                phase="subtask_loop",
+            )
+
+    # ── Feature 1: findings.md ────────────────────────────────────────────────
+    def _record_finding(self, sid: str, session: WorkerSession) -> None:
+        """One Worker turn summarizing the failure, appended to the shared
+        error-persistence log. Never allowed to fail the subtask."""
+        try:
+            summary = session.summarize_failure()
+        except Exception as exc:
+            self.bus.log(f"findings summary failed: {exc}", phase="subtask_loop", level="warn")
+            return
+        sentence = _first_sentence(summary)
+        if not sentence:
+            return
+        self.services.workspace.append_agent_doc("findings.md", f"[{sid}] {sentence}\n")
+        self.bus.emit(events.FINDINGS_ENTRY_ADDED, "subtask_loop", id=sid, summary=sentence)
 
     def _summarize_session(self, sub: dict, session: WorkerSession) -> int:
         """STEP C — Analyst summaries for every file this subtask touched."""

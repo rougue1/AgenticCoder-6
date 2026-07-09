@@ -12,17 +12,19 @@ from orchestrator.subtask_loop import SubtaskLoop
 from services import Services
 from tools.sandbox import CommandResult, Sandbox
 
+from test_sandbox import require_bwrap
+
 
 def _loop(workspace, bus):
     cfg = load_config()
     services = Services(config=cfg, bus=bus, client=LLMClient(cfg, bus), cancel_event=threading.Event())
     services.workspace = workspace
     services.sandbox = Sandbox(workspace, cfg.sandbox, bus)
-    services.sandbox.set_allowed_commands(["python", "python3", "echo", "pip", "cat"])
     return SubtaskLoop(services)
 
 
 def test_verify_runs_declared_test_command(workspace, bus):
+    require_bwrap()  # the one test here that really executes a command
     loop = _loop(workspace, bus)
     sub = {"test_command": "echo ok", "type": "implement"}
     result = loop._verify(sub)

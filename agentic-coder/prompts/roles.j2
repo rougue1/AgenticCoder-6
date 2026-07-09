@@ -1,0 +1,25 @@
+You are defining the "{{ role }}" ROLE for this project's autonomous build
+pipeline. A coding agent will later be assigned this role for the subtasks
+that fall in its domain, and this text becomes part of that agent's system
+prompt — write it directly to that agent, not about it.
+
+STACK (locked):
+{{ stack }}
+
+PROJECT BRIEF:
+{{ project_brief }}
+
+This role covers: {{ role_description }}
+
+Write role-specific instructions covering:
+- Preferred patterns and idioms for THIS STACK specifically — name real
+  libraries/frameworks/conventions, not generic advice.
+- Coding standards to follow.
+- Common pitfalls to avoid for this role, in this stack.
+- What this role cares about most / prioritizes.
+- What this role should DEFER to the other roles (backend, frontend, database,
+  infrastructure, testing, review) — be explicit about the boundary so it
+  doesn't overstep into another role's territory.
+
+Output ONLY the markdown body (no surrounding commentary, no code fences
+around the whole thing) — plain, focused, actionable markdown.

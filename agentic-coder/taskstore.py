@@ -2,8 +2,14 @@
 
 Redesign schema per subtask::
 
-    {id, title, type, intent, files[], dependencies[], test_command,
+    {id, title, type, intent, role, files[], dependencies[], test_command,
      status, is_decomposed, can_decompose}
+
+``role`` (Feature 2) is one of the built-in role names in
+``stages.roles.ROLE_DESCRIPTIONS`` (backend, frontend, database,
+infrastructure, testing, review), assigned by the Manager during task
+planning. It is a soft field: unknown/missing values just fall back to
+``backend.md`` at Worker-prompt-assembly time, never a validation failure.
 
 ``type`` ∈ {scaffold, implement, integrate, config, install}. ``status`` ∈
 {pending, in_progress, done, blocked, decomposed}. Subtasks born from a
@@ -236,6 +242,10 @@ class TaskStore:
             sub["can_decompose"] = False
             sub["decomposed_from"] = original_id
             sub["status"] = PENDING
+            # Micro-subtasks inherit the original's role when the Manager
+            # didn't assign one explicitly.
+            if not sub["role"]:
+                sub["role"] = str(original.get("role") or "")
             # Micro-subtasks inherit the original's external dependencies unless
             # the Manager supplied an explicit list.
             if not sub["dependencies"]:
@@ -345,6 +355,10 @@ def _normalize_subtask(sub: dict, *, fallback_id: str) -> dict:
         "title": str(sub.get("title") or f"Subtask {sid}"),
         "type": stype if stype in VALID_TYPES else "implement",
         "intent": str(sub.get("intent") or sub.get("description") or ""),
+        # Feature 2 (sub-agent roles): soft/optional field — an unknown or
+        # missing role just falls back to backend.md at prompt-assembly time
+        # (stages/roles.py::read_role), never a schema validation failure.
+        "role": str(sub.get("role") or "").strip().lower(),
         "files": _as_str_list(sub.get("files")),
         # accept the legacy key as an alias, canonicalize to `dependencies`
         "dependencies": _as_str_list(sub.get("dependencies") if sub.get("dependencies") is not None else sub.get("depends_on")),

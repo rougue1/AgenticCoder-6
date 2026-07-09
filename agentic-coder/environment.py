@@ -6,10 +6,14 @@ runtime environment for the detected stack.
 * **Python** — create ``<project>/.venv`` with the best available interpreter
   (``.python-version`` file > Manager-preferred version > ``python3``), then
   validate it loudly: the venv python must exist and ``pip --version`` must
-  succeed inside it. The sandbox is then pointed at the venv so every Worker
-  command is transparently rewritten/environment-scoped.
-* **Node** — verify node/npm exist; the sandbox prepends ``node_modules/.bin``
-  to PATH so npx-less tool invocations work and npm stays project-scoped.
+  succeed inside it. The sandbox is then pointed at the venv so its bin dir is
+  prepended to PATH inside every bwrap command (a convenience layer — command
+  resolution itself belongs to the sandbox's login shell).
+* **Node** — verify node/npm resolve THE WAY SANDBOXED COMMANDS WILL: through
+  the sandbox's login shell (``Sandbox.which``), so nvm/fnm/volta installs
+  count even when the orchestrator's own PATH can't see them. There are no
+  command rewriters and no PATH injection for node_modules/.bin — Worker
+  commands use the standard entry points (npx, npm run) like any developer.
 
 ``.venv``/``node_modules`` are always excluded from trees via ``.agentignore``
 (the workspace appends them unconditionally).
@@ -28,6 +32,7 @@ from stackprofiles import StackProfile
 
 if TYPE_CHECKING:
     from server.events import EventBus
+    from tools.sandbox import Sandbox
     from workspace import Workspace
 
 
@@ -40,7 +45,6 @@ class EnvInfo:
     stack_profile: str
     venv_path: Path | None = None
     python_bin: Path | None = None
-    node_root: Path | None = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -53,6 +57,7 @@ def setup_environment(
     bus: "EventBus",
     *,
     preferred_python: str = "",
+    sandbox: "Sandbox | None" = None,
 ) -> EnvInfo:
     from server import events
 
@@ -64,11 +69,15 @@ def setup_environment(
         info.notes.append(f"venv at {info.venv_path} (python: {info.python_bin})")
 
     if profile.uses_node_modules:
+        which = sandbox.which if sandbox is not None else shutil.which
         for binary in ("node", "npm"):
-            if shutil.which(binary) is None:
-                raise EnvironmentError_(f"node stack requires {binary!r}, which is not on PATH")
-        info.node_root = workspace.root
-        info.notes.append("node_modules/.bin will be prepended to PATH for project commands")
+            path = which(binary)
+            if path is None:
+                raise EnvironmentError_(
+                    f"node stack requires {binary!r}, which is not resolvable in a login shell "
+                    "(install it, e.g. via your system package manager or nvm)"
+                )
+            info.notes.append(f"{binary}: {path}")
 
     bus.emit(events.ENVIRONMENT_SETUP_COMPLETE, "environment", profile=profile.name, notes=info.notes)
     return info

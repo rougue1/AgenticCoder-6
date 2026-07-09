@@ -12,7 +12,7 @@ Redesign additions:
   never a silent skip).
 * **.agentignore** — loaded from the workspace root and applied to every
   tool-level ``read_file``/``write_file``/``patch_file`` (the ``run`` tool is
-  governed by the command allowlist instead). ``.venv/`` and ``node_modules/``
+  governed by the bwrap OS sandbox instead). ``.venv/`` and ``node_modules/``
   are always ignored.
 * **Summary slugs** — ``src/api/routes.py`` -> ``src__api__routes_py_<sha6>.md``
   for ``.agent/summaries/`` filenames (deterministic, collision-proof).
@@ -37,10 +37,11 @@ AGENT_DOCS = (
     "project_brief.md",
     "blocked.md",
     "decisions.md",
+    "findings.md",
     "test_results.jsonl",
     "final_report.md",
 )
-AGENT_SUBDIRS = ("summaries", "llm_calls/manager", "llm_calls/worker", "decompositions")
+AGENT_SUBDIRS = ("summaries", "roles", "llm_calls/manager", "llm_calls/worker", "decompositions", "sessions", "cache")
 
 # Always ignored for tool access + file trees, regardless of .agentignore.
 ALWAYS_IGNORED_DIRS = (".agent", ".venv", "node_modules", "__pycache__", ".git")

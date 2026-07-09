@@ -62,10 +62,18 @@ TASK_DECOMPOSED = "task.decomposed"
 # Taxonomy extension (same dotted style): escalation is a first-class ladder
 # rung and needs its own lifecycle event.
 TASK_ESCALATED = "task.escalated"
+# Per-subtask code review (Feature 3) and the pre-done completion gate (Feature 5).
+TASK_REVIEW_START = "task.review_start"
+TASK_REVIEW_COMPLETE = "task.review_complete"
+TASK_COMPLETION_CHECK = "task.completion_check"
 
 TEST_RUN = "test.run"
 TEST_PASSED = "test.passed"
 TEST_FAILED = "test.failed"
+
+# Shared error-persistence log (Feature 1) and the post-write formatting hook (Feature 4).
+FINDINGS_ENTRY_ADDED = "findings.entry_added"
+FORMATTER_RUN = "formatter.run"
 
 SANDBOX_COMMAND_REJECTED = "sandbox.command_rejected"
 SANDBOX_TIMEOUT = "sandbox.timeout"

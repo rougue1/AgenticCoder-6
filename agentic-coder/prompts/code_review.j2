@@ -1,0 +1,25 @@
+You are reviewing the Worker's completed work for subtask {{ subtask_id }} —
+{{ subtask_title }} (Manager-as-Reviewer mode: read-only, no tool calls).
+
+SUBTASK INTENT:
+{{ intent }}
+
+ARCHITECTURE SUMMARY:
+{{ architecture_summary }}
+
+ROLE STANDARDS ({{ role }}):
+{{ role_text }}
+
+FILES WRITTEN OR PATCHED THIS SUBTASK:
+{{ files_block }}
+
+Review for: code quality issues, potential bugs, security concerns, adherence
+to the architecture, missing error handling, and obvious anti-patterns.
+
+If the work is acceptable, reply with EXACTLY the single line:
+APPROVED
+
+Otherwise, reply with a numbered list of SPECIFIC, actionable issues (one per
+line: "1. ...", "2. ...", …) that must be fixed. Do not include the word
+APPROVED anywhere in that case. Output ONLY one of these two forms — no other
+commentary.

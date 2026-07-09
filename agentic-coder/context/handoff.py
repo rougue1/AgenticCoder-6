@@ -8,9 +8,11 @@ The Manager's handoff input consists of exactly and only:
    they exist; the ``context.always_include`` list),
 4. the recent entries of decisions.md (always included, already capped to
    ``decision_log_max_entries`` on write),
-5. file summaries for the files this subtask touches + files its dependency
+5. the last 10 lines of findings.md, the shared error-persistence log (always
+   included when it exists — prior-subtask failure learnings),
+6. file summaries for the files this subtask touches + files its dependency
    subtasks touched (added in priority order up to the token budget),
-6. the manifest-filtered file tree (added last, trimmed first).
+7. the manifest-filtered file tree (added last, trimmed first).
 
 Raw file contents NEVER appear here. ``.agent/`` never appears in the tree.
 The assembled user-content is capped at ``context.max_handoff_tokens``,
@@ -69,6 +71,14 @@ class HandoffBuilder:
         decisions = (self.workspace.read_agent_doc("decisions.md", "") or "").strip()
         if decisions:
             fixed_parts.append(f"=== Recent architectural decisions ===\n{decisions}")
+
+        # Priority 3.5: prior failure learnings (Feature 1) — the last 10 lines
+        # of the shared, append-only findings.md, so the same mistake (e.g. a
+        # library version incompatibility) isn't repeated in a later subtask.
+        findings = (self.workspace.read_agent_doc("findings.md", "") or "").strip()
+        if findings:
+            last10 = "\n".join(findings.splitlines()[-10:])
+            fixed_parts.append(f"=== PRIOR FAILURES (most recent) ===\n{last10}")
 
         used = sum(estimate_tokens(p) for p in fixed_parts)
 

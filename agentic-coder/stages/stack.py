@@ -1,10 +1,11 @@
 """Phase 1, Step 1 — Stack Determination (Manager).
 
 The Manager evaluates the user prompt and determines: the technology stack
-name, a preferred Python version (when Python-based), the explicit shell
-command allowlist the Worker may run (extending the built-in stack profile),
-the ``.agentignore`` content for this stack, and a short project brief. When
-the prompt implies no stack, the default is modern Python + FastAPI.
+name, a preferred Python version (when Python-based), the ``.agentignore``
+content for this stack, and a short project brief. When the prompt implies no
+stack, the default is modern Python + FastAPI. (Command policy is NOT part of
+this step any more: the bwrap OS sandbox jails what commands can touch, so no
+per-project command allowlist exists.)
 
 The orchestrator then (Step 2) concatenates the original prompt with this
 output into the immutable Stack-Specific Anchor.
@@ -24,7 +25,6 @@ from stages import manager
 class StackInfo:
     stack_name: str = "python-fastapi"
     python_version: str = ""
-    allowed_commands: list[str] = field(default_factory=list)
     agentignore: list[str] = field(default_factory=list)
     brief: str = ""
     raw_output: str = ""  # the Manager's full determination (anchor material)
@@ -39,7 +39,6 @@ def run(services: Services, prompt: str) -> StackInfo:
     if isinstance(data, dict):
         info.stack_name = str(data.get("stack") or data.get("stack_name") or info.stack_name).strip()
         info.python_version = str(data.get("python_version") or "").strip()
-        info.allowed_commands = [str(c).strip() for c in (data.get("allowed_commands") or []) if str(c).strip()]
         ignore = data.get("agentignore")
         if isinstance(ignore, str):
             info.agentignore = [ln for ln in ignore.splitlines() if ln.strip()]

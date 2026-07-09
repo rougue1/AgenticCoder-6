@@ -43,10 +43,16 @@ pipeline:
   tdd_hard_fail: true     # true: impl-before-test after 3 corrections = failed attempt
                           # false: log a warning and let the worker proceed untested
 
+# Command execution is jailed by an OS-level bubblewrap (bwrap) sandbox: the
+# workspace is the only writable path, sensitive dirs are hidden, commands run
+# in a login shell (nvm/pyenv tools work), network stays shared. There is no
+# command allowlist — any command runs, a small deny-list only fast-fails
+# destructive ones (and git) plus foreground dev servers (use background mode).
 sandbox:
-  timeout: 60             # seconds per foreground command
-  long_process_timeout: 30 # seconds to wait for a background server to become healthy
-  stack_profile: auto     # auto | python | node — base command allowlist + env strategy
+  timeout: 60              # seconds per foreground command
+  background_grace: 2.0    # seconds a background start is watched so instant crashes report their output
+  session_tail_lines: 200  # log lines check_session returns from a background session
+  stack_profile: auto      # auto | python | node — env strategy + preflight binaries
 
 context:
   max_summary_tokens: 300   # cap per Manager-as-Analyst file summary

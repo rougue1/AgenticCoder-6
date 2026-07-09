@@ -24,6 +24,10 @@ Rules:
 - `dependencies` lists subtask ids that must be done first. Order subtasks so
   dependencies always come earlier. No cycles.
 - `intent` is one sentence: what this subtask accomplishes.
+- `role` is exactly one of: backend, frontend, database, infrastructure,
+  testing, review — whichever domain this subtask's files/work primarily
+  belong to. If a subtask spans multiple domains (e.g. a full-stack feature),
+  pick the PRIMARY role and note the secondary domain in `intent`.
 - Keep the breakdown COARSE: a handful of substantial subtasks beats many
   trivial ones. Directories are created implicitly by writing files.
 - Use names that are VALID identifiers for the language (Python packages use
@@ -46,6 +50,7 @@ Output ONLY a single JSON object (no prose, no code fences) with this schema:
           "title": "...",
           "type": "scaffold",
           "intent": "one sentence: what this accomplishes",
+          "role": "infrastructure",
           "files": ["path/one.py", "path/two.py"],
           "dependencies": [],
           "test_command": "pytest -q",

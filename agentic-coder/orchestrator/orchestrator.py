@@ -32,8 +32,8 @@ from preflight import run_preflight
 from server import events
 from server.events import EventBus
 from services import PipelineCancelled, Services
-from stackprofiles import StackProfile, default_profile, resolve_profile
-from stages import docs, final_review, manager, summarizer, task_planner
+from stackprofiles import default_profile, resolve_profile
+from stages import docs, final_review, manager, roles as roles_stage, summarizer, task_planner
 from stages import stack as stack_stage
 from stages.stack import StackInfo
 from taskstore import DONE, PENDING, TaskStore
@@ -243,6 +243,13 @@ class Orchestrator:
             self.bus.error(str(exc), context=traceback.format_exc()[-2000:], phase=self.phase or "pipeline")
             self.bus.emit(events.PIPELINE_COMPLETE, self.phase or "pipeline", result="error", message=str(exc), **self._summary())
         finally:
+            # Belt-and-suspenders below bwrap's --die-with-parent: no background
+            # session may outlive the run that started it.
+            try:
+                if self.services.sandbox is not None:
+                    self.services.sandbox.terminate_sessions("pipeline shutdown")
+            except Exception:
+                pass
             # Free the last warm model so nothing lingers in VRAM/RAM after a
             # walk-away run (honors evict_on_model_switch; no-op when off).
             self.client.unload_all()
@@ -257,7 +264,13 @@ class Orchestrator:
         self._attach(Workspace.resolve(self.config.project_dir, slug, tool_root))
 
         with self._stage(PipelineState.PREFLIGHT, "preflight", "Pre-flight validation"):
-            run_preflight(self.config, self.workspace, default_profile(self.config.sandbox.stack_profile), self.bus)
+            run_preflight(
+                self.config,
+                self.workspace,
+                default_profile(self.config.sandbox.stack_profile),
+                self.bus,
+                sandbox=self.services.sandbox,
+            )
 
         # Step 1+2 — stack determination, project brief, the immutable anchor.
         with self._stage(PipelineState.STACK, "stack", "Determining the stack + anchor"):
@@ -266,12 +279,22 @@ class Orchestrator:
             stack_stage.write_project_brief(self.services, prompt, info)
             self._write_anchor(prompt, info)
             profile = resolve_profile(self.config.sandbox.stack_profile, info.stack_name)
-            self._configure_sandbox(profile, info.allowed_commands)
             self.bus.log(f"stack locked: {info.stack_name} (profile: {profile.name})", phase="stack")
+
+        # Feature 2 — sub-agent role definitions, generated once the stack is
+        # locked and before any doc that would need them.
+        with self._stage(PipelineState.ROLES, "roles", "Generating role definitions"):
+            roles_stage.run(self.services)
 
         # Step 3+4 — environment setup (orchestrator-side) + .agentignore.
         with self._stage(PipelineState.ENVIRONMENT, "environment", "Setting up the environment"):
-            env = setup_environment(self.workspace, profile, self.bus, preferred_python=info.python_version)
+            env = setup_environment(
+                self.workspace,
+                profile,
+                self.bus,
+                preferred_python=info.python_version,
+                sandbox=self.services.sandbox,
+            )
             self.services.environment = env
             self._apply_env_to_sandbox(env)
             self.workspace.write_agentignore(profile.default_agentignore + info.agentignore)
@@ -321,16 +344,11 @@ class Orchestrator:
         self.workspace.write_agent_doc("anchor.md", f"---\n{frontmatter}---\n\n{combined}\n")
         self.bus.log("anchor.md written (immutable from now on)", phase="stack")
 
-    def _configure_sandbox(self, profile: StackProfile, manager_commands: list[str]) -> None:
-        allowed = list(dict.fromkeys(profile.base_allowed_commands + manager_commands))
-        self.services.sandbox.set_allowed_commands(allowed)
-        self.bus.log(f"sandbox allowlist: {len(allowed)} commands", phase="stack")
-
     def _apply_env_to_sandbox(self, env) -> None:
+        # The venv bin dir rides into every sandboxed command's PATH; command
+        # resolution itself is the login shell's job (no allowlist, no rewriters).
         if env.venv_path is not None:
             self.services.sandbox.set_venv(env.venv_path)
-        if env.node_root is not None:
-            self.services.sandbox.set_node_bin(env.node_root)
 
     # ── resume (hardened) ───────────────────────────────────────────────────────
     def _resume(self) -> None:
@@ -349,8 +367,7 @@ class Orchestrator:
 
         profile = resolve_profile(self.config.sandbox.stack_profile, info.stack_name)
         with self._stage(PipelineState.PREFLIGHT, "preflight", "Pre-flight validation (resume)"):
-            run_preflight(self.config, ws, profile, self.bus)
-        self._configure_sandbox(profile, info.allowed_commands)
+            run_preflight(self.config, ws, profile, self.bus, sandbox=self.services.sandbox)
 
         store = TaskStore.load(ws)
 
@@ -364,7 +381,13 @@ class Orchestrator:
         # 3. Venv integrity: recreate if broken and re-run done install subtasks.
         if profile.uses_venv:
             venv_ok = verify_venv(ws)
-            env = setup_environment(self.workspace, profile, self.bus, preferred_python=info.python_version)
+            env = setup_environment(
+                self.workspace,
+                profile,
+                self.bus,
+                preferred_python=info.python_version,
+                sandbox=self.services.sandbox,
+            )
             self.services.environment = env
             self._apply_env_to_sandbox(env)
             if not venv_ok:
@@ -386,6 +409,17 @@ class Orchestrator:
 
         # 4. Summaries must exist for every done subtask; re-run Step C if not.
         self._backfill_summaries(store)
+
+        # 4.5. findings.md (Feature 1) is read live by HandoffBuilder on every
+        # call, so there is nothing to rebuild — just confirm continuity.
+        findings = ws.read_agent_doc("findings.md", "") or ""
+        n_findings = len([ln for ln in findings.splitlines() if ln.strip()])
+        if n_findings:
+            self.bus.log(
+                f"findings.md loaded: {n_findings} prior failure entr{'y' if n_findings == 1 else 'ies'} "
+                "carried into this session",
+                phase="resume",
+            )
 
         # 5. Reset any in_progress subtasks back to pending.
         reset = store.reset_in_progress()
@@ -500,15 +534,16 @@ def _parse_anchor(ws: Workspace) -> tuple[dict, str]:
 
 
 def _stack_info_from_anchor(meta: dict, body: str) -> StackInfo:
-    """Reconstruct the stack determination (incl. allowed_commands) from the
-    anchor body — the determination output is embedded there verbatim."""
+    """Reconstruct the stack determination from the anchor body — the
+    determination output is embedded there verbatim. (Anchors written before
+    the bwrap sandbox may still carry an ``allowed_commands`` list; it is
+    ignored — command policy is no longer per-project.)"""
     from llm.tool_parser import extract_json
 
     info = StackInfo(stack_name=str(meta.get("stack") or "python-fastapi"), raw_output=body)
     data = extract_json(body)
     if isinstance(data, dict):
         info.python_version = str(data.get("python_version") or "").strip()
-        info.allowed_commands = [str(c).strip() for c in (data.get("allowed_commands") or []) if str(c).strip()]
     return info
 
 

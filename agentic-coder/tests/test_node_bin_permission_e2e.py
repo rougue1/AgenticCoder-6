@@ -11,15 +11,13 @@ This test drives the REAL small worker model (``ornith:latest`` — never
 one real conversation turn and checks that, once it has seen our exit-126
 hint, its very next tool call is no longer the identical bare invocation.
 
-The scenario deliberately used here is a plain shell script *outside*
-node_modules/.bin (not `node_modules/.bin/tsc` itself), because that path is
-now proactively repaired/rewritten before it ever reaches the model (see
-test_sandbox.py) — this test instead covers the residual, non-Node case the
-hint in tools/registry.py._render_run exists for: any script a model wrote
-itself and forgot to chmod.
+The scenario is a plain shell script the model "wrote itself and forgot to
+chmod" — the exact case the hint in tools/registry.py._render_run exists for.
+Exit 126 semantics are unchanged inside the bwrap sandbox (the exec-bit check
+happens on the same filesystem), so the hint remains load-bearing.
 
-Opt in with ``AIFORGE_E2E=1`` and a running ``ollama serve`` with
-``ornith:latest`` pulled.
+Opt in with ``AIFORGE_E2E=1``, a running ``ollama serve`` with
+``ornith:latest`` pulled, and a functional bwrap.
 """
 
 from __future__ import annotations
@@ -33,9 +31,10 @@ from context.manifest import Manifest
 from llm.client import LLMClient
 from llm.resolution import resolve_tier
 from llm.tool_parser import ToolCall, extract_all_tool_calls
-from tools.process_manager import ProcessManager
 from tools.registry import TOOL_INSTRUCTIONS, ToolRegistry
 from tools.sandbox import Sandbox
+
+from test_sandbox import require_bwrap
 
 pytestmark = pytest.mark.e2e
 
@@ -64,6 +63,7 @@ def _model_pulled(model: str) -> bool:
 
 @pytest.mark.skipif(not os.environ.get("AIFORGE_E2E"), reason="set AIFORGE_E2E=1 to run against a real Ollama")
 def test_worker_self_corrects_after_a_real_126_with_the_new_hint(workspace, bus):
+    require_bwrap()
     if not _ollama_up():
         pytest.skip("ollama not reachable on :11434")
     if not _model_pulled(WORKER_MODEL):
@@ -76,7 +76,7 @@ def test_worker_self_corrects_after_a_real_126_with_the_new_hint(workspace, bus)
     script.chmod(0o644)
 
     sandbox = Sandbox(workspace, load_config().sandbox, bus)
-    registry = ToolRegistry(workspace, sandbox, Manifest(workspace, bus), bus, ProcessManager(workspace, sandbox, bus))
+    registry = ToolRegistry(workspace, sandbox, Manifest(workspace, bus), bus)
 
     first_call = ToolCall(name="run", args={"cmd": "./build.sh"})
     first_result = registry.dispatch(first_call, "test")

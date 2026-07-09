@@ -10,6 +10,7 @@ class PipelineState(str, Enum):
     RESOLUTION = "resolution"      # model capability resolution
     PREFLIGHT = "preflight"
     STACK = "stack"                # Step 1-2: determination + anchor
+    ROLES = "roles"                # Feature 2: sub-agent role definitions
     ENVIRONMENT = "environment"    # Step 3-4: venv/node + .agentignore
     REQUIREMENTS = "requirements"  # Step 5
     ARCHITECTURE = "architecture"  # Step 6
@@ -26,6 +27,7 @@ PIPELINE_ORDER = [
     PipelineState.RESOLUTION,
     PipelineState.PREFLIGHT,
     PipelineState.STACK,
+    PipelineState.ROLES,
     PipelineState.ENVIRONMENT,
     PipelineState.REQUIREMENTS,
     PipelineState.ARCHITECTURE,
@@ -40,7 +42,8 @@ LEGAL_TRANSITIONS: dict[PipelineState, set[PipelineState]] = {
     PipelineState.IDLE: {PipelineState.RESOLUTION},
     PipelineState.RESOLUTION: {PipelineState.PREFLIGHT},
     PipelineState.PREFLIGHT: {PipelineState.STACK, PipelineState.SUBTASK_LOOP},  # loop = resume
-    PipelineState.STACK: {PipelineState.ENVIRONMENT},
+    PipelineState.STACK: {PipelineState.ROLES},
+    PipelineState.ROLES: {PipelineState.ENVIRONMENT},
     PipelineState.ENVIRONMENT: {PipelineState.REQUIREMENTS},
     PipelineState.REQUIREMENTS: {PipelineState.ARCHITECTURE},
     PipelineState.ARCHITECTURE: {PipelineState.TASK_PLANNING},

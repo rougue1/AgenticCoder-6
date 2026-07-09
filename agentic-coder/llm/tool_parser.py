@@ -37,7 +37,7 @@ from typing import Any
 
 _TOOL_KEYS = ("tool", "name", "tool_name", "function")
 _ARG_KEYS = ("args", "arguments", "parameters", "params", "input")
-_KNOWN_TOOLS = {"read_file", "write_file", "patch_file", "run"}
+_KNOWN_TOOLS = {"read_file", "write_file", "patch_file", "run", "check_session", "stop_session"}
 # Old-name tolerance: a model that says edit_file means patch_file.
 _TOOL_ALIASES = {"edit_file": "patch_file"}
 
@@ -189,7 +189,11 @@ def _salvage_tool_call(text: str) -> ToolCall | None:
     then unescapes the raw value. Better an imperfect file the fix-loop can
     repair than losing the work entirely.
     """
-    m = re.search(r'"(?:tool|name|tool_name)"\s*:\s*"(read_file|write_file|patch_file|edit_file|run)"', text, re.I)
+    m = re.search(
+        r'"(?:tool|name|tool_name)"\s*:\s*"(read_file|write_file|patch_file|edit_file|run|check_session|stop_session)"',
+        text,
+        re.I,
+    )
     if not m:
         return None
     tool = _normalize_name(m.group(1).lower())
@@ -223,6 +227,10 @@ def _salvage_tool_call(text: str) -> ToolCall | None:
     if tool == "run":
         cmd = _grab_scalar(text, "cmd") or _grab_scalar(text, "command")
         return ToolCall("run", {"cmd": cmd}, raw=text[:200], salvaged=True) if cmd else None
+
+    if tool in ("check_session", "stop_session"):
+        sid = _grab_scalar(text, "session_id") or _grab_scalar(text, "session")
+        return ToolCall(tool, {"session_id": sid}, raw=text[:200], salvaged=True) if sid else None
     return None
 
 

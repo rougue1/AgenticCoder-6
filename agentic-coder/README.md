@@ -269,23 +269,42 @@ be rendered differently — they are never stripped.
 
 ## Safety (`tools/sandbox.py`)
 
-Every model-requested command passes through, in order:
+Every model-requested command runs inside an **OS-level bubblewrap (bwrap)
+sandbox** — security is enforced by what the process can see and write, not by
+which commands it may type (there is deliberately **no command allowlist**, so
+the tool stays stack-agnostic):
 
-1. **Working-directory jail** — `cwd` is the resolved project root; `~`, `..`
-   escapes, and absolute write targets outside the root are rejected.
-2. **Command denylist** — `rm -rf /`, `sudo`, `dd`, `mkfs`, fork bombs,
-   `shutdown`/`reboot`, `chmod -R 777 /`, `curl|wget | sh`, and **all `git`**.
-3. **Timeout** — every command is killed (whole process group) after
-   `limits.sandbox_timeout`.
-4. **Network policy** — only commands recognized as dependency installs
-   (`npm install`, `pip install`, …) are permitted to need the network; other
-   steps run with proxy env scrubbed. *Note:* airtight socket isolation requires
-   containers/namespaces, which the no-Docker constraint forbids — so this is a
-   classification-and-scrub policy, not a hard packet filter.
+1. **Filesystem jail** — host system dirs (`/usr`, `/etc`, `/opt`, …) and all
+   of `/home` are mounted **read-only**; the project workspace is the **only
+   writable path**; sensitive dirs (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`,
+   `~/.docker`, `~/.config/gh`, `~/.netrc`) are hidden behind tmpfs.
+2. **Process isolation** — fresh `/proc` + `/dev`, private PID namespace,
+   `--die-with-parent` (nothing outlives the orchestrator), `no_new_privs`
+   (sudo/setuid cannot work inside). The **network stays shared** — package
+   installs and testing against local servers need it.
+3. **Login shell** — commands run via `bash -l -c` with a filtered environment
+   (secrets like `AWS_*`, `GITHUB_*`, `*_TOKEN`, `*_KEY` never cross), so
+   nvm/fnm/volta/pyenv-managed tools work out of the box; a project venv's
+   `bin/` is prepended to `PATH`.
+4. **Deny-list (fast-fail UX, two categories)** — destructive commands
+   (`rm -rf /`, `sudo`, `dd`, `mkfs`, fork bombs, `shutdown`, `curl|sh`, and
+   **all `git`**) are always rejected; dev-server commands (`uvicorn`,
+   `npm run dev`, …) are rejected **in foreground only** with instructions to
+   use background mode.
+5. **Timeout** — every foreground command is killed after `sandbox.timeout`.
 
-Long-running targets (dev servers) go through the process harness: started in the
-background, health-checked (port/ready-log/liveness), optionally smoke-tested,
-then **always killed** (no orphans) and reduced to pass/fail.
+Long-running targets (dev servers, watchers) run as **background sessions**:
+`run {"background": true}` returns a UUID `session_id` immediately (instant
+crashes report their output right away), output streams to
+`.agent/sessions/<id>.log`, the Worker polls with `check_session` / kills with
+`stop_session`, multiple sessions run in parallel against the shared network,
+and **every session is terminated at the subtask boundary** (plus orchestrator
+exit, plus `--die-with-parent` underneath).
+
+`bwrap` is a hard pre-flight requirement (`sudo apt install bubblewrap`); the
+pre-flight probe actually builds a sandbox, and on Ubuntu 23.10+ its failure
+message includes the one-time AppArmor profile fix unprivileged user
+namespaces need.
 
 ---
 
@@ -304,7 +323,7 @@ AgenticCoder-6/                 ← repo root / launch dir (nothing tool-related
 │   ├── stages/                 intake … task_planner, planner, implementer, reviewer
 │   ├── context/                builder, loader, manifest, compressor
 │   ├── llm/                    client.py (streaming) + tool_parser.py
-│   ├── tools/                  registry.py, sandbox.py, process_manager.py
+│   ├── tools/                  registry.py + sandbox.py (bwrap OS sandbox + sessions)
 │   ├── prompts/                one Jinja2 template per phase
 │   ├── cli/renderer.py         live SSE consumer (terminal)
 │   └── ui/                     React + TS + Vite web IDE (build → ui/dist/)
@@ -329,9 +348,11 @@ python -m pytest -q          # fast suite, no LLM required
 ```
 
 They cover the fragile heuristics — the tolerant tool-call parser, the sandbox
-denylist/path-jail, tasks.json scheduling, the context compressor, conversation
-packing, thinking-mode resolution, the model-eviction policy, throughput, and
-test-command extraction. The **end-to-end** test (`tests/test_e2e_small.py`) drives
+deny-list/bwrap invocation/env filtering, background-session lifecycle,
+tasks.json scheduling, the context compressor, conversation packing,
+thinking-mode resolution, the model-eviction policy, and throughput. Sandbox
+execution tests need a functional `bwrap` and self-skip (with the AppArmor fix
+in their skip message) where unprivileged user namespaces are restricted. The **end-to-end** test (`tests/test_e2e_small.py`) drives
 the *whole* pipeline but is opt-in and uses **small models only** (never the 27B/30B):
 
 ```bash

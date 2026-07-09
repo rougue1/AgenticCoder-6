@@ -72,9 +72,10 @@ class PipelineCfg:
 
 @dataclass
 class SandboxCfg:
-    timeout: int = 60
-    long_process_timeout: int = 30
-    stack_profile: str = "auto"  # auto | python | node
+    timeout: int = 60             # seconds per foreground command
+    background_grace: float = 2.0  # seconds a background start is watched for instant crashes
+    session_tail_lines: int = 200  # log lines check_session returns (tail)
+    stack_profile: str = "auto"    # auto | python | node — env strategy + preflight binaries
 
 
 @dataclass
@@ -184,7 +185,8 @@ def load_config(
     sb = raw.get("sandbox") or {}
     sandbox = SandboxCfg(
         timeout=_int(sb.get("timeout"), 60),
-        long_process_timeout=_int(sb.get("long_process_timeout"), 30),
+        background_grace=_float(sb.get("background_grace"), 2.0),
+        session_tail_lines=_int(sb.get("session_tail_lines"), 200),
         stack_profile=str(sb.get("stack_profile") or "auto").strip().lower(),
     )
 

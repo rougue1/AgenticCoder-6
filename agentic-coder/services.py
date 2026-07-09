@@ -23,7 +23,6 @@ from context.manifest import Manifest
 from context.summaries import SummaryIndex
 from llm.client import LLMClient
 from server.events import EventBus
-from tools.process_manager import ProcessManager
 from tools.registry import ToolRegistry
 from tools.sandbox import Sandbox
 from workspace import Workspace
@@ -83,7 +82,6 @@ class Services:
     summaries: Optional[SummaryIndex] = None
     handoff_builder: Optional[HandoffBuilder] = None
     sandbox: Optional[Sandbox] = None
-    process_manager: Optional[ProcessManager] = None
     registry: Optional[ToolRegistry] = None
 
     # After Phase 1 Steps 1+3.
@@ -103,8 +101,7 @@ class Services:
         self.summaries = SummaryIndex(workspace)
         self.handoff_builder = HandoffBuilder(workspace, self.summaries, self.manifest, self.config)
         self.sandbox = Sandbox(workspace, self.config.sandbox, self.bus)
-        self.process_manager = ProcessManager(workspace, self.sandbox, self.bus)
-        self.registry = ToolRegistry(workspace, self.sandbox, self.manifest, self.bus, self.process_manager)
+        self.registry = ToolRegistry(workspace, self.sandbox, self.manifest, self.bus)
 
     @property
     def cancelled(self) -> bool:

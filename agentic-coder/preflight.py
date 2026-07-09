@@ -3,10 +3,18 @@
 Checks, in order:
 
 1. the workspace directory exists and is writeable (probe file);
-2. the Ollama service is reachable (``/api/tags`` — resolution already talked
+2. **bubblewrap works**: ``bwrap`` must be on PATH *and* able to actually
+   build a sandbox on this machine. Presence alone is not enough — Ubuntu
+   23.10+ restricts unprivileged user namespaces via AppArmor, leaving bwrap
+   installed but unusable; the functional probe catches that and the failure
+   message carries the exact fix. bwrap is a HARD requirement: there is no
+   allowlist fallback to degrade to.
+3. the Ollama service is reachable (``/api/tags`` — resolution already talked
    to it, this re-verifies right before the first pipeline call);
-3. the default stack profile's required binaries are present (hard fail) and
-   its optional binaries are present (warning only).
+4. the default stack profile's required binaries are present (hard fail) and
+   its optional binaries are present (warning only). When the sandbox probe
+   passed, binaries are resolved through the sandbox's login shell — the same
+   way Worker commands will see them — so nvm/pyenv-managed tools count.
 
 Every check emits ``preflight.check``; the pass emits ``preflight.passed`` or
 ``preflight.failed`` + :class:`PreflightError` with a descriptive message.
@@ -25,6 +33,7 @@ from stackprofiles import StackProfile
 if TYPE_CHECKING:
     from config import AppConfig
     from server.events import EventBus
+    from tools.sandbox import Sandbox
     from workspace import Workspace
 
 
@@ -32,7 +41,13 @@ class PreflightError(RuntimeError):
     """A critical pre-flight dependency is missing/broken."""
 
 
-def run_preflight(config: "AppConfig", workspace: "Workspace", profile: StackProfile, bus: "EventBus") -> None:
+def run_preflight(
+    config: "AppConfig",
+    workspace: "Workspace",
+    profile: StackProfile,
+    bus: "EventBus",
+    sandbox: "Sandbox | None" = None,
+) -> None:
     from server import events
 
     failures: list[str] = []
@@ -47,17 +62,34 @@ def run_preflight(config: "AppConfig", workspace: "Workspace", profile: StackPro
     ok, detail = _workspace_writeable(workspace)
     check("workspace_writeable", ok, detail)
 
-    # 2. Ollama reachability.
+    # 2. bubblewrap: present AND functional (hard requirement, no fallback).
+    sandbox_ok = False
+    if sandbox is not None:
+        sandbox_ok, detail = sandbox.probe()
+        check("bwrap_functional", sandbox_ok, detail)
+    else:
+        path = shutil.which("bwrap")
+        check(
+            "bwrap_installed",
+            path is not None,
+            path
+            or "bubblewrap (bwrap) is required for the OS-level sandbox but was not found on PATH "
+            "— install it (Debian/Ubuntu: `sudo apt install bubblewrap`)",
+        )
+
+    # 3. Ollama reachability.
     ok, detail = _ollama_reachable(config.ollama.host)
     check("ollama_reachable", ok, detail)
 
-    # 3. Stack binaries.
+    # 4. Stack binaries — resolved the way sandboxed commands will resolve them
+    #    (login shell) when the sandbox works; host PATH otherwise.
+    which = sandbox.which if (sandbox is not None and sandbox_ok) else shutil.which
     for binary in profile.required_binaries:
-        path = shutil.which(binary)
-        check(f"binary:{binary}", path is not None, path or f"{binary!r} not found on PATH")
+        path = which(binary)
+        check(f"binary:{binary}", path is not None, path or f"{binary!r} not found in a login shell")
     for binary in profile.optional_binaries:
-        path = shutil.which(binary)
-        check(f"binary:{binary}", path is not None, path or f"{binary!r} not found on PATH (soft)", hard=False)
+        path = which(binary)
+        check(f"binary:{binary}", path is not None, path or f"{binary!r} not found in a login shell (soft)", hard=False)
 
     for warning in warnings:
         bus.log(f"pre-flight warning: {warning}", phase="preflight", level="warn")
